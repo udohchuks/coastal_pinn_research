@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "coastal_pinn"
+version = "0.1.0"
+description = "Multi-region coastal-erosion data pipeline for PINN training (Ghana coastline)"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "All rights reserved" }
+authors = [
+    { name = "Coastal PINN Data Pipeline" },
+]
+keywords = ["coastal", "erosion", "PINN", "GEE", "GEBCO", "Copernicus", "NOAA"]
+
+dependencies = [
+    "numpy>=1.26",
+    "pandas>=2.1",
+    "xarray>=2024.1",
+    "requests>=2.31",
+    "matplotlib>=3.8",
+    "pyyaml>=6.0",
+    "utm>=0.8",
+    "pyproj>=3.6",
+    "copernicusmarine>=2.0",
+    "earthengine-api>=1.0",
+    "netCDF4>=1.6",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-cov>=4.1",
+]
+
+[project.scripts]
+coastal_pinn = "coastal_pinn.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["coastal_pinn*"]
+
+[tool.setuptools.package-data]
+coastal_pinn = ["py.typed"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --tb=short"

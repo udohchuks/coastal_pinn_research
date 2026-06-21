@@ -1,0 +1,33 @@
+region:
+  name: keta
+  bbox: [0.80, 5.85, 1.40, 6.10]
+  utm_zone: 31N
+  transect:
+    - [1.40, 5.95]
+    - [0.80, 5.95]
+
+time:
+  start: 2018-01-01
+  end:   2018-03-31
+
+cache:
+  root: coastal_research_ashesi
+  strategy: append_only
+
+reconcile:
+  join_tolerance: 36h
+
+sources:
+  bathymetry:
+    enabled: true
+    product: gebco_2026
+  sea_level:
+    enabled: true
+    product: copernicus_phy_anfc
+  wave_intensity:
+    enabled: true
+    product: noaa_ww3
+  shoreline:
+    enabled: true
+    gee_project: igem2026
+    sitename: Keta

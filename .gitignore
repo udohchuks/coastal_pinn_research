@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+*.egg
+.pytest_cache/
+.coverage
+.coverage.*
+htmlcov/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+env/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Package cache (data we produce). Commit only config/, not data/.
+coastal_research_ashesi/
+data/
+
+# Credentials / secrets
+.env
+.env.*
+!.env.example
+credentials.json
+*credentials*.json
+
+# Old notebook (the pipeline replaces it)
+*.ipynb
+.ipynb_checkpoints/
