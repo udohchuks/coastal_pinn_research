@@ -92,18 +92,22 @@ def real_shape_sea_level_nc(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def real_shape_waves_nc(tmp_path: Path) -> Path:
-    """Write a minimal real-shape NOAA WAVEWATCH III NetCDF fixture (3-hourly)."""
-    path = tmp_path / "ww3_fixture.nc"
+    """Write a minimal real-shape Copernicus WAM NetCDF fixture (3-hourly).
+
+    Uses the WAM variable names (VHM0, VMDR) since the fetcher is now
+    Copernicus WAM, not WAVEWATCH III.
+    """
+    path = tmp_path / "wam_fixture.nc"
     times = pd.date_range("2018-01-01", periods=8 * 5, freq="3h").values  # naive ns
     lats = np.linspace(5.0, 6.5, 6)
     lons = np.linspace(0.5, 1.5, 8)
     rng = np.random.default_rng(1)
     ds = xr.Dataset(
         {
-            "shgt": (("time", "latitude", "longitude"),
+            "VHM0": (("time", "latitude", "longitude"),
                      (1.0 + 0.3 * rng.standard_normal(times.size * lats.size * lons.size)
                       .reshape(times.size, lats.size, lons.size)).astype("float32")),
-            "mwd":  (("time", "latitude", "longitude"),
+            "VMDR":  (("time", "latitude", "longitude"),
                      (200 + 20 * rng.standard_normal(times.size * lats.size * lons.size)
                       .reshape(times.size, lats.size, lons.size)).astype("float32")),
         },
@@ -115,17 +119,26 @@ def real_shape_waves_nc(tmp_path: Path) -> Path:
 
 @pytest.fixture()
 def real_shape_shoreline_pkl(tmp_path: Path) -> Path:
-    """Write a pickle of CoastSat output dict (real shape)."""
+    """Write a pickle of CoastSat output dict (real shape).
+
+    Polylines are in UTM (output_epsg=32631), as the production fetcher
+    sets `output_epsg = cfg.region.epsg`. The polylines are positioned
+    at the Keta coast (UTM northing ~657k for lat=5.95), which is
+    within the 15-km transect reach from the inland baseline at lat=6.05.
+    """
     import pickle
+    from coastal_pinn.core.coords import lonlat_to_utm
     path = tmp_path / "shoreline_fixture.pkl"
     rng = np.random.default_rng(7)
     dates = pd.date_range("2018-01-04", periods=5, freq="9D", tz="UTC")
     sh = {"dates": list(dates), "shorelines": [], "satname": ["S2"] * len(dates)}
     for _ in dates:
         npts = 30
+        # Generate in lon/lat at the Keta coast, then convert to UTM
         lons = 1.05 + np.linspace(-0.005, 0.005, npts) + rng.normal(0, 0.0002, npts)
         lats = 5.95 + np.linspace(-0.001, 0.001, npts) + rng.normal(0, 0.0002, npts)
-        sh["shorelines"].append(np.column_stack([lons, lats]))
+        x, y = lonlat_to_utm(lons, lats, "31N")
+        sh["shorelines"].append(np.column_stack([x, y]))
     with open(path, "wb") as f:
         pickle.dump(sh, f)
     return path

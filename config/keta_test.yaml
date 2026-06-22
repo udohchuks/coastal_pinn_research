@@ -1,14 +1,16 @@
 region:
   name: keta
-  bbox: [0.80, 5.85, 1.40, 6.10]
+  bbox: [0.90, 5.80, 1.10, 6.00]
   utm_zone: 31N
-  transect:
-    - [1.40, 5.95]
-    - [0.80, 5.95]
+  baseline:
+    - [1.10, 6.00]
+    - [0.90, 6.00]
+  transect_spacing_m: 100
+  transect_length_m: 5000
 
 time:
   start: 2018-01-01
-  end:   2018-03-31
+  end:   2018-01-15
 
 cache:
   root: coastal_research_ashesi
@@ -26,8 +28,8 @@ sources:
     product: copernicus_phy_anfc
   wave_intensity:
     enabled: true
-    product: noaa_ww3
+    product: copernicus_wam
   shoreline:
     enabled: true
     gee_project: igem2026
-    sitename: Keta
+    sitename: KetaTest

@@ -1,7 +1,7 @@
 """Tests for coastal_pinn.sources.sea_level (post-fetch transformation only).
 
-Verifies that the cached NetCDF is correctly reduced to a daily UTC-aware
-DataFrame with h_m, u_east_m_s, u_north_m_s columns.
+Verifies that the cached NetCDF is correctly reduced to a per-(transect, day)
+UTC-aware DataFrame with h_m, u_east_m_s, u_north_m_s, transect_id columns.
 """
 
 from __future__ import annotations
@@ -15,8 +15,8 @@ from coastal_pinn.sources.sea_level import _read_cached, _to_dataframe
 def test_sea_level_to_dataframe_columns(keta_config, real_shape_sea_level_nc):
     ds = _read_cached(real_shape_sea_level_nc)
     df = _to_dataframe(ds, keta_config)
-    assert set(df.columns) >= {"region", "timestamp", "h_m",
-                               "u_east_m_s", "u_north_m_s"}
+    assert set(df.columns) >= {"region", "timestamp", "transect_id",
+                               "h_m", "u_east_m_s", "u_north_m_s"}
     assert (df["region"] == "keta").all()
 
 
@@ -27,26 +27,24 @@ def test_sea_level_timestamps_are_utc(keta_config, real_shape_sea_level_nc):
     assert str(df["timestamp"].dt.tz) == "UTC"
 
 
-def test_sea_level_resampled_to_daily(keta_config, real_shape_sea_level_nc):
+def test_sea_level_has_per_transect_rows(keta_config, real_shape_sea_level_nc):
     ds = _read_cached(real_shape_sea_level_nc)
     df = _to_dataframe(ds, keta_config)
-    # 5 days of hourly data -> at most 5 daily rows
-    assert len(df) <= 5
-    # days are unique
-    assert df["timestamp"].dt.date.nunique() == len(df)
+    # Per-transect output: more than just per-date
+    n_transects = df["transect_id"].nunique()
+    n_days = df["timestamp"].dt.date.nunique()
+    # at least one row per (transect, day) pair
+    assert len(df) >= n_transects * n_days
 
 
 def test_sea_level_missing_zos_raises(keta_config, tmp_cache_root):
     import numpy as np
     import pandas as pd
-    # Build the dataset fully in memory and close it before passing to the
-    # fetcher; on Windows xarray holds the file lock until close().
-    times = pd.date_range("2018-01-01", periods=4, freq="h")  # naive ns
+    times = pd.date_range("2018-01-01", periods=4, freq="h")
     ds = xr.Dataset(
         {"uo": ("time", np.zeros(4)), "vo": ("time", np.zeros(4))},
         coords={"time": times, "latitude": [5.0], "longitude": [0.5]},
     )
-    # serialize then reopen via file path so the in-memory dataset can be GC'd
     import tempfile, os
     tmp = tempfile.NamedTemporaryFile(suffix=".nc", delete=False)
     tmp.close()
@@ -67,20 +65,36 @@ def test_sea_level_depth_collapse_averaging(keta_config):
     """Verify that multiple depth layers are collapsed via mean, not just ignored."""
     import numpy as np
     import pandas as pd
+    from coastal_pinn.sources.transects import generate_transects
+    from coastal_pinn.core.coords import utm_to_lonlat
     times = pd.date_range("2018-01-01", periods=2, freq="h")
-    # depth layers: one has value 10, the other has value 20 -> mean should be 15
+    # depth layers: one has value 10, the other has value 20 -> mean should be 15.
+    # Use the transect lons as data lons. The fetcher now clamps query lons
+    # to the data range, so no monkey-patching is needed.
+    transects = generate_transects(keta_config.region)
+    transect_lons, _ = utm_to_lonlat(
+        transects["origin_x"].tolist(), transects["origin_y"].tolist(),
+        keta_config.region.utm_zone,
+    )
+    # Sort lons ascending (xarray requires monotonic coords)
+    lons = np.sort(transect_lons)
+    n_lons = len(lons)
+    val = np.zeros((2, 2, 1, n_lons), dtype="float32")
+    val[0, 0, 0, :] = 10.0
+    val[0, 1, 0, :] = 20.0
+    val[1, 0, 0, :] = 10.0
+    val[1, 1, 0, :] = 20.0
     ds = xr.Dataset(
         {
-            "zos": (("time", "depth", "latitude", "longitude"),
-                    np.array([[[[10.0]], [[20.0]]], [[[10.0]], [[20.0]]]]).astype("float32")),
-            "uo":  (("time", "depth", "latitude", "longitude"),
-                    np.array([[[[10.0]], [[20.0]]], [[[10.0]], [[20.0]]]]).astype("float32")),
-            "vo":  (("time", "depth", "latitude", "longitude"),
-                    np.array([[[[10.0]], [[20.0]]], [[[10.0]], [[20.0]]]]).astype("float32")),
+            "zos": (("time", "depth", "latitude", "longitude"), val),
+            "uo":  (("time", "depth", "latitude", "longitude"), val),
+            "vo":  (("time", "depth", "latitude", "longitude"), val),
         },
-        coords={"time": times, "depth": [0.0, 5.0], "latitude": [5.9], "longitude": [1.0]},
+        coords={"time": times, "depth": [0.0, 5.0], "latitude": [6.05], "longitude": lons},
     )
     df = _to_dataframe(ds, keta_config)
+    # depth is collapsed to mean 15.0 before per-transect interpolation
+    # All transects should get 15.0 (query lons are clamped to data range)
     assert (df["h_m"] == 15.0).all()
     assert (df["u_east_m_s"] == 15.0).all()
     assert (df["u_north_m_s"] == 15.0).all()

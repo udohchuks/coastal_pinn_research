@@ -14,9 +14,9 @@ import pytest
 
 from coastal_pinn import PipelineConfig
 from coastal_pinn.pipeline import reconcile
-from coastal_pinn.sources.bathymetry import _extract_points
+from coastal_pinn.sources.bathymetry import _extract_per_transect
 from coastal_pinn.sources.sea_level import _to_dataframe as sl_to_df
-from coastal_pinn.sources.shoreline import _to_dataframe as shore_to_df
+from coastal_pinn.sources.shoreline import _intersect_with_transects
 from coastal_pinn.sources.wave_intensity import _to_dataframe as wv_to_df
 from coastal_pinn.exceptions import SourceUnavailable
 import xarray as xr
@@ -24,7 +24,7 @@ import xarray as xr
 
 def _make_bathy_df(keta_config, real_shape_bathy_nc):
     ds = xr.open_dataset(real_shape_bathy_nc)
-    return _extract_points(ds, keta_config)
+    return _extract_per_transect(ds, keta_config)
 
 
 def _make_sea_level_df(keta_config, real_shape_sea_level_nc):
@@ -38,8 +38,9 @@ def _make_waves_df(keta_config, real_shape_waves_nc):
 
 
 def _make_shoreline_df(keta_config, real_shape_shoreline_pkl):
-    d = pd.read_pickle(real_shape_shoreline_pkl)
-    return shore_to_df(d, keta_config)
+    with open(real_shape_shoreline_pkl, "rb") as f:
+        d = pickle.load(f)
+    return _intersect_with_transects(d, keta_config)
 
 
 def test_reconcile_full_pipeline(keta_config, real_shape_bathy_nc,
@@ -62,6 +63,10 @@ def test_reconcile_full_pipeline(keta_config, real_shape_bathy_nc,
     assert wide["timestamp"].dt.tz is not None
     assert str(wide["timestamp"].dt.tz) == "UTC"
     assert (wide["region"] == "keta").all()
+    # Per-(transect, date) rows
+    assert "transect_id" in wide.columns
+    assert "along_shore_x_m" in wide.columns
+    assert "cross_shore_S_m" in wide.columns
     # no NaN in required columns
     assert wide[PINN_REQUIRED_COLUMNS].notna().all().all()
     # R_sediment_m_yr is allowed to be NaN (placeholder)
@@ -82,8 +87,9 @@ def test_reconcile_empty_shoreline_raises(keta_config, real_shape_bathy_nc,
     bathy = _make_bathy_df(keta_config, real_shape_bathy_nc)
     sl    = _make_sea_level_df(keta_config, real_shape_sea_level_nc)
     wv    = _make_waves_df(keta_config, real_shape_waves_nc)
-    shore = pd.DataFrame(columns=["region", "timestamp", "sat", "pt_idx",
-                                  "easting_m", "northing_m"])
+    # Empty shoreline in the new per-transect schema
+    shore = pd.DataFrame(columns=["region", "timestamp", "transect_id",
+                                  "along_shore_x_m", "cross_shore_S_m", "sat"])
 
     with pytest.raises(SourceUnavailable):
         reconcile(keta_config, bathy, sl, wv, shore)

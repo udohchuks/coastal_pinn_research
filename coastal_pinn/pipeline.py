@@ -1,17 +1,25 @@
-"""Pipeline orchestration.
+"""Pipeline orchestration (v2, per-transect One-Line Model).
 
 run(cfg)        runs all enabled sources for one region and returns the wide table.
 run([cfg, ...]) runs multiple regions and concatenates the per-region tables.
 reconcile(...)  joins per-source DataFrames into the wide table (the contract).
 
+Schema: per-(transect, date) long format. ~150,000 rows for Keta 2018-2025.
+
 All timestamps flowing into reconcile() are guaranteed UTC tz-aware by the
-fetch_* functions. merge_asof will throw a hard error if any are naive;
-this is the contract that every fetcher upholds.
+fetch_* functions. merge_asof will throw a hard error if any are naive.
+
+All four sources are fetched in parallel via ThreadPoolExecutor. Progress
+is printed to stdout so the user can see which source is downloading,
+processing, or done.
 """
 
 from __future__ import annotations
 
+import sys
+import time
 import warnings
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable
 
@@ -19,7 +27,7 @@ import numpy as np
 import pandas as pd
 
 from coastal_pinn.config import PipelineConfig, Region
-from coastal_pinn.core.coords import depth_at_shore
+from coastal_pinn.core.coords import compute_wave_longshore
 from coastal_pinn.core.io import write_csv_atomic, write_pickle_atomic
 from coastal_pinn.core.paths import pinn_wide_path
 from coastal_pinn.core.schema import (
@@ -33,6 +41,42 @@ from coastal_pinn.sources.sea_level import fetch_sea_level
 from coastal_pinn.sources.wave_intensity import fetch_wave_intensity
 from coastal_pinn.sources.shoreline import fetch_shorelines
 from coastal_pinn.sources.sediment_recovery import compute_sediment_recovery
+from coastal_pinn.sources.transects import generate_transects
+
+
+# ---------------------------------------------------------------------------
+# Progress helpers
+# ---------------------------------------------------------------------------
+
+def _log(source: str, msg: str, *, end: str = "\n") -> None:
+    """Print a progress line tagged with the source name."""
+    print(f"[{source:16s}] {msg}", end=end, flush=True)
+
+
+def _run_one_logged(fn, cfg: PipelineConfig, name: str,
+                    skip_sources: Iterable[str], offline: bool) -> pd.DataFrame:
+    """Run a single fetcher with progress logging and timing."""
+    if name in skip_sources:
+        _log(name, "skipped (in skip_sources)")
+        return _empty_for(name)
+    if offline and not _cache_exists(cfg, name):
+        raise SourceUnavailable(name,
+            f"offline mode and no cache file for {name} in {cfg.data_dir}")
+
+    cache_file = _cache_path(cfg, name)
+    from_cache = cache_file.exists() if cache_file else False
+
+    _log(name, f"starting ({'from cache' if from_cache else 'downloading'})...")
+    t0 = time.time()
+    try:
+        df = fn(cfg)
+        elapsed = time.time() - t0
+        _log(name, f"done: {len(df)} rows in {elapsed:.1f}s")
+        return df
+    except Exception as e:
+        elapsed = time.time() - t0
+        _log(name, f"FAILED after {elapsed:.1f}s: {e}")
+        raise
 
 
 # ---------------------------------------------------------------------------
@@ -43,25 +87,57 @@ def run_region(cfg: PipelineConfig, *, skip_sources: Iterable[str] = (),
                offline: bool = False) -> pd.DataFrame:
     """Run all enabled sources for one region and return the wide table.
 
+    All four sources are fetched in parallel. The forcing sources
+    (bathymetry, sea_level, wave_intensity) typically finish in seconds;
+    the shoreline source (CoastSat + GEE) takes much longer.
+
     skip_sources: a list of source names to skip even if enabled.
-        Useful for partial smoke tests ('give me everything except shoreline').
     offline: if True, fail fast on cache miss instead of fetching from network.
     """
-    bathy_df = _run_one(fetch_bathymetry, cfg, "bathymetry", skip_sources, offline)
-    sea_level_df = _run_one(fetch_sea_level, cfg, "sea_level", skip_sources, offline)
-    waves_df = _run_one(fetch_wave_intensity, cfg, "wave_intensity", skip_sources, offline)
-    shore_df = _run_one(fetch_shorelines, cfg, "shoreline", skip_sources, offline)
+    sources = {
+        "bathymetry": fetch_bathymetry,
+        "sea_level": fetch_sea_level,
+        "wave_intensity": fetch_wave_intensity,
+        "shoreline": fetch_shorelines,
+    }
 
-    return reconcile(cfg, bathy_df, sea_level_df, waves_df, shore_df)
+    skip_set = set(skip_sources)
+    results: dict[str, pd.DataFrame] = {}
+
+    _log("pipeline", f"running {len(sources)} sources for {cfg.region.name} "
+         f"[{cfg.t_start} to {cfg.t_end}] in parallel...")
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        future_to_name = {
+            executor.submit(
+                _run_one_logged, fn, cfg, name, skip_set, offline
+            ): name
+            for name, fn in sources.items()
+        }
+        for future in as_completed(future_to_name):
+            name = future_to_name[future]
+            try:
+                results[name] = future.result()
+            except Exception as e:
+                # Cancel remaining futures
+                for f in future_to_name:
+                    f.cancel()
+                raise SourceUnavailable(name, f"source {name} failed: {e}", cause=e) from e
+
+    _log("pipeline", "all sources fetched, reconciling...")
+
+    return reconcile(
+        cfg,
+        results["bathymetry"],
+        results["sea_level"],
+        results["wave_intensity"],
+        results["shoreline"],
+    )
 
 
 def run(configs: list[PipelineConfig], *, offline: bool = False,
         continue_on_error: bool = False) -> pd.DataFrame:
-    """Run for multiple regions and concatenate the per-region wide tables.
-
-    Returns a single DataFrame with all regions' rows stacked. The 'region'
-    column distinguishes them.
-    """
+    """Run for multiple regions and concatenate the per-region wide tables."""
     tables: list[pd.DataFrame] = []
     errors: list[tuple[str, Exception]] = []
     for cfg in configs:
@@ -87,10 +163,7 @@ def run(configs: list[PipelineConfig], *, offline: bool = False,
 
 def build_from_cache(configs: list[PipelineConfig], out_csv: Path | None = None
                      ) -> pd.DataFrame:
-    """Build the wide table from cache only (no network).
-
-    If out_csv is given, also writes the concatenated CSV there.
-    """
+    """Build the wide table from cache only (no network)."""
     wide = run(configs, offline=True)
     if out_csv is not None:
         write_csv_atomic(wide, out_csv)
@@ -105,21 +178,22 @@ def reconcile(cfg: PipelineConfig,
     """Join per-source DataFrames into the PINN wide table.
 
     Steps:
-      1. Aggregate shoreline per (region, timestamp) -> scalar (mean Easting, mean Northing)
-      2. Resample sea_level / waves to daily means (already daily from fetchers)
-      3. asof-join shoreline <- sea_level, shoreline <- waves, with cfg.join_tolerance
-      4. Attach scalar depth_at_shore_m from bathymetry (broadcast)
-      5. Leave R_sediment_m_yr as NaN (sediment_recovery not implemented)
-      6. Drop rows with any NaN in PINN_REQUIRED_COLUMNS
-      7. Validate schema, write CSV + pkl to cfg.output_dir
+      1. Normalize all timestamps to UTC tz-aware.
+      2. For each (transect_id, shoreline_timestamp), find nearest sea level
+         and waves within cfg.join_tolerance (per-transect asof join).
+      3. Compute u_mag from u_east and u_north.
+      4. Compute W_longshore = W_m * sin(2*theta) using shore-normal direction.
+      5. Attach per-transect depth_m from bathymetry.
+      6. Leave R_sediment_m_yr as NaN (sediment_recovery not implemented).
+      7. Drop rows with any NaN in PINN_REQUIRED_COLUMNS.
+      8. Validate schema, write CSV + pkl to cfg.output_dir.
     """
     from coastal_pinn.core.schema import ensure_utc
     if shoreline_df.empty:
         raise SourceUnavailable("shoreline",
             f"no shoreline observations for {cfg.region.name} in [{cfg.t_start}, {cfg.t_end}]")
 
-    # Normalize all timestamps to UTC tz-aware with consistent resolution
-    # (datetime64[ns, UTC]). merge_asof requires matching dtypes.
+    # Normalize timestamps
     shoreline_df = shoreline_df.copy()
     shoreline_df["timestamp"] = ensure_utc(shoreline_df["timestamp"])
     sea_level_df = sea_level_df.copy()
@@ -127,29 +201,29 @@ def reconcile(cfg: PipelineConfig,
     waves_df = waves_df.copy()
     waves_df["timestamp"] = ensure_utc(waves_df["timestamp"])
 
-    # 1. shoreline -> scalar per (region, timestamp)
-    s_scalar = (shoreline_df
-                .groupby(["region", "timestamp"], as_index=False)
-                .agg(easting_m=("easting_m", "mean"),
-                     northing_m=("northing_m", "mean")))
+    # Sort all by timestamp (required for merge_asof with by=)
+    shoreline_df = shoreline_df.sort_values("timestamp")
+    sea_level_df = sea_level_df.sort_values("timestamp")
+    waves_df = waves_df.sort_values("timestamp")
 
-    # 2. Sea level and waves: indexed by (region, timestamp), already daily
-    sl = sea_level_df.set_index(["region", "timestamp"]).sort_index()
-    wv = waves_df.set_index(["region", "timestamp"]).sort_index()
-
-    # 3. asof-join shoreline -> sea_level and shoreline -> waves
     tolerance = pd.Timedelta(cfg.join_tolerance)
 
-    s_scalar = s_scalar.sort_values("timestamp")
-    sl_reset = sea_level_df.sort_values("timestamp")
-    wv_reset = waves_df.sort_values("timestamp")
-
-    merged = pd.merge_asof(
-        s_scalar, sl_reset,
-        on="timestamp", by="region",
-        direction="nearest", tolerance=tolerance,
+    # Vectorized as-of join using pandas native by= parameter.
+    # Both dataframes are sorted by timestamp (required by merge_asof);
+    # the by="transect_id" groups the join per-transect in one call.
+    merged = _per_transect_asof(
+        shoreline_df, sea_level_df,
+        on="timestamp", by="transect_id",
+        tolerance=tolerance,
     )
-    # Compute current speed magnitude from east/north components
+    # After merge, drop duplicate transect_id column (if added) and
+    # ensure single canonical name
+    if "transect_id_x" in merged.columns:
+        merged = merged.drop(columns=["transect_id_x"])
+    if "transect_id_y" in merged.columns:
+        merged = merged.rename(columns={"transect_id_y": "transect_id"})
+
+    # Compute current speed magnitude
     if "u_east_m_s" in merged.columns and "u_north_m_s" in merged.columns:
         merged["u_mag_m_s"] = np.sqrt(
             merged["u_east_m_s"].astype(float) ** 2
@@ -160,18 +234,43 @@ def reconcile(cfg: PipelineConfig,
             f"sea_level table missing u_east_m_s / u_north_m_s; got {list(merged.columns)}"
         )
 
-    merged = pd.merge_asof(
-        merged, wv_reset,
-        on="timestamp", by="region",
-        direction="nearest", tolerance=tolerance,
+    merged = _per_transect_asof(
+        merged, waves_df,
+        on="timestamp", by="transect_id",
+        tolerance=tolerance,
+    )
+    # After second merge, drop duplicate transect_id column again
+    if "transect_id_x" in merged.columns:
+        merged = merged.drop(columns=["transect_id_x"])
+    if "transect_id_y" in merged.columns:
+        merged = merged.rename(columns={"transect_id_y": "transect_id"})
+
+    # Per-transect depth (static)
+    if "depth_m" in bathy_df.columns:
+        depth_by_transect = bathy_df.set_index("transect_id")["depth_m"]
+        merged["depth_m"] = merged["transect_id"].map(depth_by_transect)
+    else:
+        raise SchemaError(
+            f"bathymetry table missing depth_m; got {list(bathy_df.columns)}"
+        )
+
+    # W_longshore: derive from W_m, W_dir_deg, and per-transect shore_normal_deg.
+    # We need the transects table to get shore_normal_deg.
+    transects_df = generate_transects(cfg.region)
+    sn_by_transect = transects_df.set_index("transect_id")["shore_normal_deg"]
+    sn_per_row = merged["transect_id"].map(sn_by_transect).values
+    W_dir = merged["W_dir_deg"].values
+    W_m = merged["W_m"].values
+    # compute_wave_longshore expects (T, N) or (N,) arrays. Here we have
+    # shape (M,) where M is the number of merged rows. shore_normal is
+    # per-row but constant within a transect.
+    merged["W_longshore"] = compute_wave_longshore(
+        W_m=W_m,
+        W_dir_deg=W_dir,
+        shore_normal_deg=sn_per_row,
     )
 
-    # 4. depth_at_shore_m scalar from bathy
-    merged["depth_at_shore_m"] = depth_at_shore(bathy_df)
-
-    # 5. R_sediment_m_yr is currently NaN (not implemented). Try anyway for
-    # users who later wire in a real source; if it raises NotImplementedError,
-    # leave NaN.
+    # R_sediment_m_yr is currently NaN (not implemented)
     try:
         dates_index = pd.DatetimeIndex(merged["timestamp"].unique())
         r_series = compute_sediment_recovery(cfg, dates_index)
@@ -181,7 +280,7 @@ def reconcile(cfg: PipelineConfig,
     except NotImplementedError:
         merged["R_sediment_m_yr"] = np.nan
 
-    # 6. Drop rows with missing required inputs. No fabrication.
+    # Drop rows with missing required inputs
     n_total = len(merged)
     merged = merged.dropna(subset=PINN_REQUIRED_COLUMNS).reset_index(drop=True)
     n_dropped = n_total - len(merged)
@@ -195,7 +294,7 @@ def reconcile(cfg: PipelineConfig,
     # Final column order
     merged = merged[PINN_COLUMNS]
 
-    # 7. Validate schema
+    # Validate schema
     validate_schema(merged)
 
     # Write to disk
@@ -225,19 +324,37 @@ def _run_one(fn, cfg: PipelineConfig, name: str,
 def _empty_for(name: str) -> pd.DataFrame:
     """Return an empty DataFrame with the canonical columns for `name`."""
     if name == "bathymetry":
-        return pd.DataFrame(columns=["region", "lon", "lat", "depth_m", "zone"])
+        return pd.DataFrame(columns=["region", "transect_id", "depth_m"])
     if name == "sea_level":
-        return pd.DataFrame(columns=["region", "timestamp", "h_m",
-                                     "u_east_m_s", "u_north_m_s"])
+        return pd.DataFrame(columns=["region", "timestamp", "transect_id",
+                                     "h_m", "u_east_m_s", "u_north_m_s"])
     if name == "wave_intensity":
-        return pd.DataFrame(columns=["region", "timestamp", "W_m", "W_dir_deg"])
+        return pd.DataFrame(columns=["region", "timestamp", "transect_id",
+                                     "W_m", "W_dir_deg"])
     if name == "shoreline":
-        return pd.DataFrame(columns=["region", "timestamp", "sat", "pt_idx",
-                                     "easting_m", "northing_m"])
+        return pd.DataFrame(columns=["region", "timestamp", "transect_id",
+                                     "along_shore_x_m", "cross_shore_S_m", "sat"])
     raise ValueError(f"unknown source: {name}")
 
 
-def _cache_exists(cfg: PipelineConfig, name: str) -> bool:
+def _cache_path(cfg: PipelineConfig, name: str) -> Path | None:
+    """Return the cache file path for a source, or None if not applicable."""
     from coastal_pinn.core.paths import data_path
     suffix = "pkl" if name == "shoreline" else "nc"
-    return data_path(cfg, name, suffix=suffix).exists()
+    return data_path(cfg, name, suffix=suffix)
+
+
+def _cache_exists(cfg: PipelineConfig, name: str) -> bool:
+    p = _cache_path(cfg, name)
+    return p.exists() if p else False
+
+
+def _per_transect_asof(left: pd.DataFrame, right: pd.DataFrame,
+                       *, on: str, by: str,
+                       tolerance: pd.Timedelta) -> pd.DataFrame:
+    """Per-transect merge_asof using pandas native by= parameter."""
+    return pd.merge_asof(
+        left, right,
+        on=on, by=by,
+        direction="nearest", tolerance=tolerance,
+    )

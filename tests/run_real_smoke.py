@@ -24,7 +24,7 @@ sys.path.insert(0, str(ROOT))
 
 from coastal_pinn import PipelineConfig, REGIONS
 from coastal_pinn.pipeline import reconcile
-from coastal_pinn.sources.bathymetry import _extract_points
+from coastal_pinn.sources.bathymetry import _extract_per_transect
 from coastal_pinn.sources.sea_level import _to_dataframe as sl_to_df
 from coastal_pinn.sources.shoreline import _to_dataframe as shore_to_df
 from coastal_pinn.sources.wave_intensity import _to_dataframe as wv_to_df
@@ -42,7 +42,7 @@ def _make_bathy(cfg: PipelineConfig, path: Path) -> pd.DataFrame:
     ds.to_netcdf(path); ds.close()
     ds = xr.open_dataset(path)
     try:
-        return _extract_points(ds, cfg)
+        return _extract_per_transect(ds, cfg)
     finally:
         ds.close()
 

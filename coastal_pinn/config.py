@@ -24,18 +24,26 @@ from coastal_pinn.exceptions import ConfigError
 
 @dataclass(frozen=True)
 class Region:
-    """A named coastal region.
+    """A named coastal region (standard One-Line Model geometry).
 
     bbox: (lon_min, lat_min, lon_max, lat_max) in WGS84 degrees.
     utm_zone: e.g. '31N', '30N'. Used by shoreline/coord conversions.
-    transect: optional (lon, lat) endpoints defining the cross-shore
-        reference transect. PINN input uses the UTM coords directly, but
-        this is exposed for cross-shore distance computation if needed.
+    baseline: inland polyline of (lon, lat) points, drawn parallel to the
+        general coastline trend. USED AS the reference for transect casting
+        (DSAS convention). The PINN measures cross-shore distance S from
+        this baseline seaward.
+    transect_spacing_m: along-shore spacing between transects, in meters
+        (DSAS default 100 m).
+    transect_length_m: cross-shore length of each perpendicular transect,
+        in meters. Must be long enough to span from the inland baseline
+        seaward past the observed shoreline.
     """
     name: str
     bbox: tuple[float, float, float, float]
     utm_zone: str
-    transect: tuple[tuple[float, float], tuple[float, float]] | None = None
+    baseline: tuple[tuple[float, float], ...] | None = None
+    transect_spacing_m: float = 100.0
+    transect_length_m: float = 500.0
 
     def lon_min(self) -> float: return self.bbox[0]
     def lat_min(self) -> float: return self.bbox[1]
@@ -87,11 +95,16 @@ class PipelineConfig:
     sea_level_product: str = "copernicus_phy_anfc"
 
     wave_intensity_enabled: bool = True
-    wave_intensity_product: str = "noaa_ww3"
+    wave_intensity_product: str = "copernicus_wam"
 
     shoreline_enabled: bool = True
     shoreline_gee_project: str = "igem2026"
     shoreline_sitename: str = "Keta"
+    # When False (default), CoastSat skips writing per-image QA JPEGs and
+    # per-detection figures. These are visual-QA only and do not affect the
+    # extracted shoreline data, but they dominate the per-image processing
+    # time. Set True when you need to eyeball the detections.
+    shoreline_save_qc: bool = False
 
     # reconciliation
     join_tolerance: str = "36h"   # pandas Timedelta-compatible string
@@ -127,7 +140,14 @@ REGIONS: dict[str, Region] = {
         name="keta",
         bbox=(0.80, 5.85, 1.40, 6.10),
         utm_zone="31N",
-        transect=((1.40, 5.95), (0.80, 5.95)),
+        # Inland baseline parallel to the Keta coast (which runs roughly
+        # east-west at lat ~5.95). The baseline is set ~0.10 deg inland
+        # (lat ~6.05) so x=0 is inland and transects extend seaward.
+        baseline=((1.40, 6.05), (0.80, 6.05)),
+        transect_spacing_m=100.0,
+        # Keta's baseline is ~11 km inland of the coast, so transects
+        # must be at least 15 km long to span the full distance with margin.
+        transect_length_m=15000.0,
     ),
 }
 
@@ -175,21 +195,25 @@ def _raw_to_config(raw: dict[str, Any], source: str = "<dict>") -> PipelineConfi
         raise ConfigError(f"{source}: 'region.bbox' must be a 4-element list")
     bbox = tuple(float(x) for x in bbox_raw)
 
-    transect = None
-    if "transect" in region_raw and region_raw["transect"] is not None:
-        tr = region_raw["transect"]
-        if not isinstance(tr, (list, tuple)) or len(tr) != 2:
-            raise ConfigError(f"{source}: 'region.transect' must be 2 points")
-        transect = (
-            (float(tr[0][0]), float(tr[0][1])),
-            (float(tr[1][0]), float(tr[1][1])),
-        )
+    baseline = None
+    if "baseline" in region_raw and region_raw["baseline"] is not None:
+        bl = region_raw["baseline"]
+        if not isinstance(bl, (list, tuple)) or len(bl) < 2:
+            raise ConfigError(
+                f"{source}: 'region.baseline' must be a list of >= 2 (lon, lat) points"
+            )
+        baseline = tuple((float(p[0]), float(p[1])) for p in bl)
+
+    transect_spacing_m = float(region_raw.get("transect_spacing_m", 100.0))
+    transect_length_m = float(region_raw.get("transect_length_m", 500.0))
 
     region = Region(
         name=str(region_raw["name"]),
         bbox=bbox,
         utm_zone=str(region_raw["utm_zone"]),
-        transect=transect,
+        baseline=baseline,
+        transect_spacing_m=transect_spacing_m,
+        transect_length_m=transect_length_m,
     )
 
     time_raw = raw["time"]
@@ -212,6 +236,9 @@ def _raw_to_config(raw: dict[str, Any], source: str = "<dict>") -> PipelineConfi
 
     join_tolerance = str(raw.get("reconcile", {}).get("join_tolerance", "36h"))
 
+    shoreline_src = sources.get("shoreline") or {}
+    shoreline_save_qc = bool(shoreline_src.get("save_qc", False))
+
     return PipelineConfig(
         region=region,
         t_start=t_start,
@@ -222,10 +249,11 @@ def _raw_to_config(raw: dict[str, Any], source: str = "<dict>") -> PipelineConfi
         sea_level_enabled=_src_bool("sea_level", True),
         sea_level_product=_src_str("sea_level", "product", "copernicus_phy_anfc"),
         wave_intensity_enabled=_src_bool("wave_intensity", True),
-        wave_intensity_product=_src_str("wave_intensity", "product", "noaa_ww3"),
+        wave_intensity_product=_src_str("wave_intensity", "product", "copernicus_wam"),
         shoreline_enabled=_src_bool("shoreline", True),
         shoreline_gee_project=_src_str("shoreline", "gee_project", "igem2026"),
         shoreline_sitename=_src_str("shoreline", "sitename", "Keta"),
+        shoreline_save_qc=shoreline_save_qc,
         join_tolerance=join_tolerance,
     )
 
@@ -237,6 +265,8 @@ def init_config_yaml(region: Region, out_path: str | Path) -> None:
             "name": region.name,
             "bbox": list(region.bbox),
             "utm_zone": region.utm_zone,
+            "transect_spacing_m": region.transect_spacing_m,
+            "transect_length_m": region.transect_length_m,
         },
         "time": {
             "start": "2018-01-01",
@@ -247,12 +277,12 @@ def init_config_yaml(region: Region, out_path: str | Path) -> None:
         "sources": {
             "bathymetry": {"enabled": True, "product": "gebco_2026"},
             "sea_level": {"enabled": True, "product": "copernicus_phy_anfc"},
-            "wave_intensity": {"enabled": True, "product": "noaa_ww3"},
-            "shoreline": {"enabled": True, "gee_project": "igem2026", "sitename": region.name.title()},
+            "wave_intensity": {"enabled": True, "product": "copernicus_wam"},
+            "shoreline": {"enabled": True, "gee_project": "igem2026", "sitename": region.name.title(), "save_qc": False},
         },
     }
-    if region.transect is not None:
-        body["region"]["transect"] = [list(region.transect[0]), list(region.transect[1])]
+    if region.baseline is not None:
+        body["region"]["baseline"] = [list(p) for p in region.baseline]
     out = Path(out_path)
     out.parent.mkdir(parents=True, exist_ok=True)
     out.write_text(yaml.safe_dump(body, sort_keys=False), encoding="utf-8")

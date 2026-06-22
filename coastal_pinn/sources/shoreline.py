@@ -1,18 +1,17 @@
-"""Shoreline source: Google Earth Engine + CoastSat.
+"""Shoreline source: Google Earth Engine + CoastSat with N-transect intersection.
 
 Fetches cloud-free Sentinel-2 / Landsat-8 imagery via Earth Engine, runs
-the CoastSat shoreline classifier, and returns the per-date polylines as
-UTM (easting, northing) coordinates -- matching the per-paper
-convention (PDF Figure 1, the −7.68 m/yr rate is computed in UTM
-Easting).
+the CoastSat shoreline classifier, intersects the per-date polylines with
+N perpendicular transects (DSAS convention, generated from the inland
+baseline), and returns the per-(transect, date) cross-shore distances.
 
 Outputs DataFrame with columns:
-    region       (str)
-    timestamp    (pd.Timestamp, UTC, per cloud-free satellite date)
-    sat          (str, 'S2' | 'L8')
-    pt_idx       (int, vertex index along the polyline)
-    easting_m    (float, UTM Easting, m)
-    northing_m   (float, UTM Northing, m)
+    region              str
+    timestamp           pd.Timestamp, UTC
+    transect_id         int, 0..N-1
+    along_shore_x_m     float, transect's along-shore position (m)
+    cross_shore_S_m     float, observed shoreline cross-shore distance (m)
+    sat                 str, 'S2' | 'L8' | 'UNK'
 
 Caches the dict (shorelines + dates) to a pickle under
 cfg.data_dir/shoreline/. Append-only.
@@ -42,6 +41,10 @@ from coastal_pinn.core.io import write_pickle_atomic, read_pickle
 from coastal_pinn.core.paths import data_path
 from coastal_pinn.core.schema import ensure_utc
 from coastal_pinn.exceptions import SourceUnavailable
+from coastal_pinn.sources.transects import (
+    generate_transects,
+    transect_intersection_distance,
+)
 
 
 def _patch_skimage_io():
@@ -85,8 +88,6 @@ def _patch_skimage_io():
     mod.imsave.__doc__ = "Pillow-backed imsave shim."
     mod.imread.__doc__ = "imageio-backed imread shim."
     sys.modules["skimage.io"] = mod
-    # Also register as a submodule of skimage so ``from skimage.io import …``
-    # resolves to our shim.
     try:
         import skimage
         skimage.io = mod  # type: ignore[attr-defined]
@@ -94,8 +95,7 @@ def _patch_skimage_io():
         pass
 
 
-# Where CoastSat expects the cloned repo on disk, and where it puts
-# classifier models. In Colab these are /content/CoastSat and /content/classification.
+# Where CoastSat expects the cloned repo on disk
 COASTSAT_REPO_PATHS = [
     Path("/content/CoastSat"),
     Path(os.environ.get("COASTSAT_REPO", "")),
@@ -111,21 +111,26 @@ def _resolve_coastsat_repo() -> Path | None:
 
 
 def fetch_shorelines(cfg: PipelineConfig) -> pd.DataFrame:
-    """Fetch shoreline polylines via GEE + CoastSat for cfg.region.
+    """Fetch shoreline polylines via GEE + CoastSat and intersect with N transects.
 
-    Returns a long DataFrame with one row per (date, vertex).
-
-    The polylines are stored in lon/lat and converted to UTM at the
-    fetch boundary (per the paper's UTM-based rate calculation).
+    Returns a long-format DataFrame with one row per (date, transect).
+    The polylines are intersected with each of the N transects generated
+    from cfg.region.baseline. The intersection distance from each transect
+    origin is the cross-shore shoreline position S(x_n, t).
     """
     if not cfg.shoreline_enabled:
         raise SourceUnavailable("shoreline", "disabled in config")
 
     cache = data_path(cfg, "shoreline", suffix="pkl")
     if cache.exists():
+        print("[shoreline       ] cache hit, intersecting with transects...", flush=True)
         shoreline_dict = read_pickle(cache)
     else:
         cache.parent.mkdir(parents=True, exist_ok=True)
+        print("[shoreline       ] downloading satellite images via GEE + CoastSat "
+              f"(bbox={cfg.region.bbox}, {cfg.t_start} to {cfg.t_end})...", flush=True)
+        print("[shoreline       ] this is the slowest source — expect 2-5 min per "
+              "satellite image...", flush=True)
         try:
             shoreline_dict = _download_shorelines(cfg)
         except SourceUnavailable:
@@ -135,35 +140,12 @@ def fetch_shorelines(cfg: PipelineConfig) -> pd.DataFrame:
                 f"GEE/CoastSat fetch failed for {cfg.region.name}: {e}",
                 cause=e) from e
         write_pickle_atomic(shoreline_dict, cache)
+        print(f"[shoreline       ] CoastSat done: {len(shoreline_dict.get('dates', []))} "
+              "cloud-free dates cached", flush=True)
 
-    return _to_dataframe(shoreline_dict, cfg)
-
-
-def _tile_polygon(polygon: list[list[float]], max_deg: float = 0.25) -> list[list[list[float]]]:
-    """Split a rectangular polygon into smaller tiles.
-
-    GEE's ``getDownloadURL`` has a 50 MB limit. Large polygons at 10 m
-    resolution can exceed this. Tiling keeps each export under the cap.
-    """
-    lons = [p[0] for p in polygon]
-    lats = [p[1] for p in polygon]
-    lon_min, lon_max = min(lons), max(lons)
-    lat_min, lat_max = min(lats), max(lats)
-
-    tiles: list[list[list[float]]] = []
-    lon = lon_min
-    while lon < lon_max:
-        lat = lat_min
-        while lat < lat_max:
-            tiles.append([
-                [lon, lat],
-                [min(lon + max_deg, lon_max), lat],
-                [min(lon + max_deg, lon_max), min(lat + max_deg, lat_max)],
-                [lon, min(lat + max_deg, lat_max)],
-            ])
-            lat += max_deg
-        lon += max_deg
-    return tiles
+    print(f"[shoreline       ] intersecting {len(shoreline_dict.get('dates', []))} "
+          "dates with transects...", flush=True)
+    return _intersect_with_transects(shoreline_dict, cfg)
 
 
 def _download_shorelines(cfg: PipelineConfig) -> dict[str, Any]:
@@ -187,8 +169,6 @@ def _download_shorelines(cfg: PipelineConfig) -> dict[str, Any]:
     if str(repo) not in sys.path:
         sys.path.insert(0, str(repo))
 
-    # Patch skimage.io before CoastSat imports it to avoid a Windows DLL
-    # crash (0xc06d007f) caused by conflicting native image libraries.
     _patch_skimage_io()
 
     try:
@@ -206,11 +186,9 @@ def _download_shorelines(cfg: PipelineConfig) -> dict[str, Any]:
     try:
         ee.Initialize(project=cfg.shoreline_gee_project)
     except Exception:
-        # First-time auth: opens a browser. Token is then cached.
         ee.Authenticate()
         ee.Initialize(project=cfg.shoreline_gee_project)
 
-    # CoastSat expects a polygon as list of [lon, lat] vertices
     lon_min, lat_min, lon_max, lat_max = cfg.region.bbox
     polygon = [
         [lon_min, lat_min], [lon_max, lat_min],
@@ -220,7 +198,7 @@ def _download_shorelines(cfg: PipelineConfig) -> dict[str, Any]:
     inputs = {
         "polygon": polygon,
         "dates": [cfg.t_start, cfg.t_end],
-        "sat_list": ["S2", "L8"],
+        "sat_list": ["S2"],
         "sitename": cfg.shoreline_sitename,
         "filepath": str(cfg.data_dir),
     }
@@ -228,36 +206,45 @@ def _download_shorelines(cfg: PipelineConfig) -> dict[str, Any]:
         "inputs": inputs,
         "cloud_thresh": 0.5,
         "dist_clouds": 300,
+        # Output in the region's UTM projection so polylines and transects
+        # are in the same CRS for intersection.
         "output_epsg": cfg.region.epsg,
         "min_beach_area": 4500,
         "min_length_sl": 500,
         "s2cloudless_prob": 60,
         "sand_color": "default",
         "check_detection": False,
-        "save_figure": True,
+        # QA figures are visual-only and dominate per-image processing time.
+        # Off by default; controlled via cfg.shoreline_save_qc.
+        "save_figure": cfg.shoreline_save_qc,
         "adjust_detection": False,
         "pan_off": False,
         "cloud_mask_issue": False,
         "buffer_size": 150,
     }
 
-    # If the bbox is small enough, a single export stays under 50 MB.
-    # At 10 m resolution: 0.10° ≈ 11 km ≈ 1100 px.  With 13 S2 bands
-    # at 2 bytes each that is ~31 MB — safely under the 50 MB cap.
     MAX_TILE_DEG = 0.10
     lon_span = lon_max - lon_min
     lat_span = lat_max - lat_min
 
     if lon_span <= MAX_TILE_DEG and lat_span <= MAX_TILE_DEG:
+        print("[shoreline       ] downloading satellite images from GEE...", flush=True)
         metadata = SDS_download.retrieve_images(inputs)
-        SDS_preprocess.save_jpg(metadata, settings)
-        return SDS_shoreline.extract_shorelines(metadata, settings)
+        if cfg.shoreline_save_qc:
+            print("[shoreline       ] preprocessing images (cloud masking, jpg)...", flush=True)
+            SDS_preprocess.save_jpg(metadata, settings)
+        print("[shoreline       ] extracting shorelines (pixel classifier + sub-pixel)...", flush=True)
+        result = SDS_shoreline.extract_shorelines(metadata, settings)
+        print(f"[shoreline       ] extracted {len(result.get('dates', []))} shorelines", flush=True)
+        return result
 
-    # Large polygon – tile and merge downloads before shoreline extraction
+    import concurrent.futures
+
     tiles = _tile_polygon(polygon, MAX_TILE_DEG)
+    print(f"[shoreline       ] bbox too large, tiling into {len(tiles)} tiles. Downloading with 18 threads...", flush=True)
     merged_result: dict[str, list] = {}
 
-    for tile_idx, tile in enumerate(tiles):
+    def _process_tile(tile_idx, tile):
         tile_inputs = dict(inputs)
         tile_inputs["polygon"] = tile
         tile_inputs["sitename"] = f"{inputs['sitename']}_tile{tile_idx}"
@@ -265,74 +252,223 @@ def _download_shorelines(cfg: PipelineConfig) -> dict[str, Any]:
         tile_settings = dict(settings)
         tile_settings["inputs"] = tile_inputs
 
-        metadata = SDS_download.retrieve_images(tile_inputs)
-        SDS_preprocess.save_jpg(metadata, tile_settings)
+        print(f"[shoreline       ] tile {tile_idx+1}/{len(tiles)}: downloading...", flush=True)
+        try:
+            metadata = SDS_download.retrieve_images(tile_inputs)
+            if cfg.shoreline_save_qc:
+                print(f"[shoreline       ] tile {tile_idx+1}/{len(tiles)}: preprocessing...", flush=True)
+                SDS_preprocess.save_jpg(metadata, tile_settings)
+            print(f"[shoreline       ] tile {tile_idx+1}/{len(tiles)}: extracting shorelines...", flush=True)
 
-        # Extract shorelines per tile (different tiles can have different
-        # pixel dimensions, so we can't merge metadata across tiles).
-        tile_result = SDS_shoreline.extract_shorelines(metadata, tile_settings)
-        for key, value in tile_result.items():
-            merged_result.setdefault(key, []).extend(value)
+            tile_result = SDS_shoreline.extract_shorelines(metadata, tile_settings)
+            return tile_result
+        except Exception as e:
+            print(f"[shoreline       ] tile {tile_idx+1}/{len(tiles)} failed: {e}. Skipping.", flush=True)
+            return None
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
+        futures = {executor.submit(_process_tile, i, tile): i for i, tile in enumerate(tiles)}
+        for future in concurrent.futures.as_completed(futures):
+            tile_result = future.result()
+            if tile_result is not None:
+                for key, value in tile_result.items():
+                    merged_result.setdefault(key, []).extend(value)
 
     return merged_result
 
 
-def _to_dataframe(shoreline_dict: dict[str, Any], cfg: PipelineConfig) -> pd.DataFrame:
-    """Flatten a CoastSat output dict into a (region, timestamp, sat, pt_idx,
-    easting_m, northing_m) DataFrame.
+def _tile_polygon(polygon: list[list[float]], max_deg: float = 0.25) -> list[list[list[float]]]:
+    """Split a rectangular polygon into smaller tiles for GEE export."""
+    lons = [p[0] for p in polygon]
+    lats = [p[1] for p in polygon]
+    lon_min, lon_max = min(lons), max(lons)
+    lat_min, lat_max = min(lats), max(lats)
 
-    Handles both flat-merged and per-satellite dict layouts (CoastSat
-    2.x and 1.x). Coordinates are converted from lon/lat to UTM at this
-    boundary, per the paper's UTM-based convention.
+    tiles: list[list[list[float]]] = []
+    lon = lon_min
+    while lon < lon_max:
+        lat = lat_min
+        while lat < lat_max:
+            tiles.append([
+                [lon, lat],
+                [min(lon + max_deg, lon_max), lat],
+                [min(lon + max_deg, lon_max), min(lat + max_deg, lat_max)],
+                [lon, min(lat + max_deg, lat_max)],
+            ])
+            lat += max_deg
+        lon += max_deg
+    return tiles
+
+
+def _intersect_with_transects(shoreline_dict: dict[str, Any],
+                              cfg: PipelineConfig) -> pd.DataFrame:
+    """Intersect CoastSat polylines with N transects generated from baseline.
+
+    Returns a long-format DataFrame with columns:
+        region, timestamp, transect_id, along_shore_x_m, cross_shore_S_m, sat
+
+    Uses CoastSat's SDS_transects.compute_intersection_QC if available
+    (recommended per the user's choice); falls back to a shapely-based
+    per-transect intersection otherwise.
     """
-    rows: list[dict[str, Any]] = []
-    if not isinstance(shoreline_dict, dict):
-        raise SourceUnavailable("shoreline",
-            f"unexpected shoreline_dict type: {type(shoreline_dict).__name__}")
+    transects_df = generate_transects(cfg.region)
+    n_transects = len(transects_df)
 
+    # Normalize the CoastSat output to a flat list of (timestamp, polyline, sat)
+    polylines: list[tuple[Any, np.ndarray, str]] = []
     if "dates" in shoreline_dict and "shorelines" in shoreline_dict:
-        # Merged format: {dates: [...], shorelines: [...], satname: [...]}
+        sat_list = shoreline_dict.get("satname")
         for idx in range(len(shoreline_dict["dates"])):
             ts = shoreline_dict["dates"][idx]
             sl = shoreline_dict["shorelines"][idx]
-            sat_list = shoreline_dict.get("satname")
             sat = sat_list[idx] if sat_list is not None and idx < len(sat_list) else "UNK"
-            _append_polyline(rows, ts, sl, sat, cfg)
+            if sl is None:
+                continue
+            arr = np.asarray(sl)
+            if arr.ndim == 3:
+                arr = arr[0]
+            if arr.size == 0 or arr.ndim < 2:
+                continue
+            polylines.append((ts, arr, sat))
     else:
-        # Per-satellite format: {sat: {dates, shorelines}}
         for sat, data in shoreline_dict.items():
             if not isinstance(data, dict) or "dates" not in data:
                 continue
             for ts, sl in zip(data["dates"], data["shorelines"]):
-                _append_polyline(rows, ts, sl, sat, cfg)
+                if sl is None:
+                    continue
+                arr = np.asarray(sl)
+                if arr.ndim == 3:
+                    arr = arr[0]
+                if arr.size == 0 or arr.ndim < 2:
+                    continue
+                polylines.append((ts, arr, str(sat)))
 
-    if not rows:
+    if not polylines:
         raise SourceUnavailable("shoreline",
             "CoastSat returned no polylines for the given time window and ROI")
 
+    # Convert polylines to UTM if they're in lon/lat (only needed if
+    # output_epsg was not honored or CoastSat's SDS_transects isn't used).
+    # Our settings set output_epsg = region.epsg so they should already be UTM.
+    use_coastsat_intersect = _try_use_coastsat_intersect(
+        shoreline_dict, transects_df, cfg
+    )
+    if use_coastsat_intersect is not None:
+        return use_coastsat_intersect
+
+    # Shapely fallback: per-transect intersection for each (date, polyline)
+    rows: list[dict[str, Any]] = []
+    for ts, polyline_xy, sat in polylines:
+        ts_utc = ensure_utc(pd.Timestamp(ts))
+        for _, tr in transects_df.iterrows():
+            d = transect_intersection_distance(
+                polyline_xy,
+                (float(tr["origin_x"]), float(tr["origin_y"])),
+                (float(tr["end_x"]), float(tr["end_y"])),
+            )
+            if d is None or not np.isfinite(d):
+                continue
+            # Clamp negative distances to 0 (shoreline cannot be inland of
+            # baseline by definition)
+            d_clamped = max(0.0, float(d))
+            rows.append({
+                "timestamp": ts_utc,
+                "transect_id": int(tr["transect_id"]),
+                "along_shore_x_m": float(tr["along_shore_x_m"]),
+                "cross_shore_S_m": d_clamped,
+                "sat": str(sat),
+            })
+
+    if not rows:
+        raise SourceUnavailable("shoreline",
+            "No intersections between polylines and transects for this region/window")
+
     df = pd.DataFrame(rows)
     df["region"] = cfg.region.name
-    df["timestamp"] = ensure_utc(df["timestamp"])
-    return df[["region", "timestamp", "sat", "pt_idx", "easting_m", "northing_m"]]
+    return df[["region", "timestamp", "transect_id", "along_shore_x_m",
+               "cross_shore_S_m", "sat"]]
 
 
-def _append_polyline(rows: list[dict[str, Any]], ts, sl, sat: str,
-                     cfg: PipelineConfig) -> None:
-    """Append one polyline to the rows list, converting lon/lat to UTM."""
-    if sl is None:
-        return
-    arr = np.asarray(sl)
-    if arr.size == 0 or arr.ndim < 2:
-        return
-    lons = arr[:, 0]
-    lats = arr[:, 1]
-    easting, northing = lonlat_to_utm(lons, lats, cfg.region.utm_zone)
-    ts_utc = ensure_utc(pd.Timestamp(ts))
-    for i, (e, n) in enumerate(zip(easting, northing)):
-        rows.append({
-            "timestamp": ts_utc,
-            "sat": str(sat),
-            "pt_idx": int(i),
-            "easting_m": float(e),
-            "northing_m": float(n),
-        })
+def _try_use_coastsat_intersect(shoreline_dict, transects_df, cfg):
+    """Try to use CoastSat's SDS_transects.compute_intersection_QC.
+
+    Returns a DataFrame in our schema, or None if CoastSat's transect
+    module isn't available / the polylines aren't in the expected format.
+    """
+    repo = _resolve_coastsat_repo()
+    if repo is None:
+        return None
+    if str(repo) not in sys.path:
+        sys.path.insert(0, str(repo))
+    try:
+        from coastsat import SDS_transects  # type: ignore
+    except Exception:
+        return None
+
+    # Build CoastSat transects dict: {name: np.array of [[x0,y0],[x1,y1]]}
+    cs_transects: dict[str, np.ndarray] = {}
+    for _, tr in transects_df.iterrows():
+        name = f"t{int(tr['transect_id']):04d}"
+        cs_transects[name] = np.array([
+            [float(tr["origin_x"]), float(tr["origin_y"])],
+            [float(tr["end_x"]), float(tr["end_y"])],
+        ])
+
+    settings_qc = {
+        "along_dist": 25,
+        "min_points": 3,
+        "max_std": 15,
+        "max_range": 30,
+        "min_chainage": -100,
+        "multiple_inter": "auto",
+        "auto_prc": 0.1,
+    }
+    try:
+        cross_distance = SDS_transects.compute_intersection_QC(
+            shoreline_dict, cs_transects, settings_qc
+        )
+    except Exception:
+        return None
+
+    # cross_distance is {transect_name: np.array of per-date distances}
+    rows: list[dict[str, Any]] = []
+    # Need to recover timestamps and sat per index
+    if "dates" in shoreline_dict and "shorelines" in shoreline_dict:
+        dates = list(shoreline_dict["dates"])
+        sats = list(shoreline_dict.get("satname") or ["UNK"] * len(dates))
+    else:
+        dates, sats = [], []
+        for sat, data in shoreline_dict.items():
+            if isinstance(data, dict) and "dates" in data:
+                for ts in data["dates"]:
+                    dates.append(ts)
+                    sats.append(str(sat))
+    if len(sats) < len(dates):
+        sats = sats + ["UNK"] * (len(dates) - len(sats))
+
+    transect_by_name = {f"t{int(r['transect_id']):04d}": r
+                        for _, r in transects_df.iterrows()}
+    for name, distances in cross_distance.items():
+        tr = transect_by_name.get(name)
+        if tr is None:
+            continue
+        for i, d in enumerate(distances):
+            if i >= len(dates):
+                break
+            if d is None or not np.isfinite(d):
+                continue
+            d_clamped = max(0.0, float(d))
+            rows.append({
+                "timestamp": ensure_utc(pd.Timestamp(dates[i])),
+                "transect_id": int(tr["transect_id"]),
+                "along_shore_x_m": float(tr["along_shore_x_m"]),
+                "cross_shore_S_m": d_clamped,
+                "sat": sats[i] if i < len(sats) else "UNK",
+            })
+    if not rows:
+        return None
+    df = pd.DataFrame(rows)
+    df["region"] = cfg.region.name
+    return df[["region", "timestamp", "transect_id", "along_shore_x_m",
+               "cross_shore_S_m", "sat"]]

@@ -18,13 +18,15 @@ def _good_df() -> pd.DataFrame:
     return pd.DataFrame({
         "region": ["keta"] * 3,
         "timestamp": pd.to_datetime(["2018-01-01", "2018-01-15", "2018-02-01"], utc=True),
-        "easting_m": [945281.0, 945270.0, 945260.0],
-        "northing_m": [657084.0, 657080.0, 657071.0],
+        "transect_id": [0, 1, 2],
+        "along_shore_x_m": [0.0, 100.0, 200.0],
+        "cross_shore_S_m": [450.0, 448.0, 446.0],
         "h_m": [0.1, 0.2, 0.15],
         "u_mag_m_s": [0.1, 0.12, 0.11],
         "W_m": [1.0, 1.1, 0.9],
         "W_dir_deg": [200.0, 210.0, 195.0],
-        "depth_at_shore_m": [-10.0, -10.0, -10.0],
+        "W_longshore": [-0.5, -0.4, -0.6],
+        "depth_m": [-10.0, -10.0, -10.0],
         "R_sediment_m_yr": [0.0, 0.0, 0.0],
     })
 

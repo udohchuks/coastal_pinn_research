@@ -1,6 +1,6 @@
 """Tests for coastal_pinn.sources.shoreline (post-fetch transformation only).
 
-Tests _to_dataframe against a real-shape CoastSat output pickle.
+Tests _intersect_with_transects against a real-shape CoastSat output pickle.
 """
 
 from __future__ import annotations
@@ -12,41 +12,45 @@ import pytest
 from coastal_pinn import PipelineConfig
 from coastal_pinn.core.io import read_pickle
 from coastal_pinn.exceptions import SourceUnavailable
-from coastal_pinn.sources.shoreline import _to_dataframe
+from coastal_pinn.sources.shoreline import _intersect_with_transects
 
 
-def test_shoreline_to_dataframe_columns(keta_config, real_shape_shoreline_pkl):
+def test_shoreline_intersect_columns(keta_config, real_shape_shoreline_pkl):
     d = read_pickle(real_shape_shoreline_pkl)
-    df = _to_dataframe(d, keta_config)
-    assert set(df.columns) >= {"region", "timestamp", "sat", "pt_idx",
-                               "easting_m", "northing_m"}
+    df = _intersect_with_transects(d, keta_config)
+    # New per-transect schema
+    assert set(df.columns) >= {"region", "timestamp", "transect_id",
+                               "along_shore_x_m", "cross_shore_S_m", "sat"}
     assert (df["region"] == "keta").all()
 
 
 def test_shoreline_timestamps_are_utc(keta_config, real_shape_shoreline_pkl):
     d = read_pickle(real_shape_shoreline_pkl)
-    df = _to_dataframe(d, keta_config)
+    df = _intersect_with_transects(d, keta_config)
     assert df["timestamp"].dt.tz is not None
     assert str(df["timestamp"].dt.tz) == "UTC"
 
 
-def test_shoreline_coords_in_utm_zone_31n(keta_config, real_shape_shoreline_pkl):
-    """Easting/Northing should be in UTM 31N (Ghana)."""
+def test_shoreline_cross_shore_in_range(keta_config, real_shape_shoreline_pkl):
+    """S values should be in [0, transect_length_m] (i.e. between baseline and seaward end)."""
     d = read_pickle(real_shape_shoreline_pkl)
-    df = _to_dataframe(d, keta_config)
-    # Keta is around lon=1.0, lat=5.95. UTM 31N easting is ~260k-265k, northing ~656k-657k
-    assert df["easting_m"].between(200_000, 350_000).all()
-    assert df["northing_m"].between(600_000, 700_000).all()
+    df = _intersect_with_transects(d, keta_config)
+    if not df.empty:
+        assert (df["cross_shore_S_m"] >= 0).all()
+        # max should be <= transect_length_m
+        assert (df["cross_shore_S_m"] <= keta_config.region.transect_length_m).all()
 
 
-def test_shoreline_pt_idx_monotonic(keta_config, real_shape_shoreline_pkl):
+def test_shoreline_has_per_transect_rows(keta_config, real_shape_shoreline_pkl):
+    """Each cloud-free date should have a row per intersected transect."""
     d = read_pickle(real_shape_shoreline_pkl)
-    df = _to_dataframe(d, keta_config)
-    # pt_idx within each timestamp should be 0..N-1
-    for ts, sub in df.groupby("timestamp"):
-        assert list(sub["pt_idx"]) == list(range(len(sub)))
+    df = _intersect_with_transects(d, keta_config)
+    n_transects_with_data = df["transect_id"].nunique()
+    # The fixture polylines are localized near the bbox center;
+    # at least one transect should have intersected.
+    assert n_transects_with_data >= 1
 
 
 def test_shoreline_empty_raises(keta_config):
     with pytest.raises(SourceUnavailable, match="no polylines"):
-        _to_dataframe({"dates": [], "shorelines": []}, keta_config)
+        _intersect_with_transects({"dates": [], "shorelines": []}, keta_config)

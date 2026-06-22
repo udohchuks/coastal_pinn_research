@@ -2,13 +2,22 @@ region:
   name: keta
   bbox: [0.80, 5.85, 1.40, 6.10]
   utm_zone: 31N
-  transect:
-    - [1.40, 5.95]
-    - [0.80, 5.95]
+  # Inland baseline parallel to the Keta coast (which runs roughly
+  # east-west at lat ~5.95). The baseline is set ~0.10 deg inland
+  # (lat ~6.05) so x=0 is inland and transects extend seaward.
+  baseline:
+    - [1.40, 6.05]
+    - [0.80, 6.05]
+  # DSAS default along-shore transect spacing
+  transect_spacing_m: 100
+  # Cross-shore transect length: Keta's baseline is ~11 km inland of
+  # the coast, so transects must be long enough to span the full
+  # distance. 15 km gives margin past the actual shoreline.
+  transect_length_m: 15000
 
 time:
   start: 2018-01-01
-  end:   2018-12-31
+  end:   2024-12-31
 
 cache:
   root: coastal_research_ashesi
@@ -26,7 +35,7 @@ sources:
     product: copernicus_phy_anfc
   wave_intensity:
     enabled: true
-    product: noaa_ww3
+    product: copernicus_wam
   shoreline:
     enabled: true
     gee_project: igem2026
