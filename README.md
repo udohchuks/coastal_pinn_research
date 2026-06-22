@@ -53,10 +53,16 @@ fetch boundary to avoid `merge_asof` errors when joining sources.
 
 ## Install
 
-Requires Python 3.11+.
+Requires Python 3.11+. We recommend using a dedicated `conda` environment.
 
 ```powershell
-# Install the package in editable mode (in the conda base environment)
+# Create a new conda environment
+conda create -n coastal_pinn python=3.11 -y
+
+# Activate the environment
+conda activate coastal_pinn
+
+# Install the package and dependencies in editable mode
 pip install -e ".[dev]"
 ```
 
