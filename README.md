@@ -64,6 +64,9 @@ conda activate coastal_pinn
 
 # Install the package and dependencies in editable mode
 pip install -e ".[dev]"
+
+# Clone the CoastSat repository into the project directory
+git clone https://github.com/kvos/CoastSat.git
 ```
 
 This installs `coastal_pinn` and exposes a `coastal_pinn` CLI on your PATH.
