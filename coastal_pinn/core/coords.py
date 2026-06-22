@@ -64,6 +64,31 @@ def transects_to_lonlat(transects: pd.DataFrame, utm_zone: str
     return out
 
 
+def transect_sample_points(
+    transects: pd.DataFrame,
+    utm_zone: str,
+    *,
+    seaward_frac: float = 1.0,
+) -> tuple[np.ndarray, np.ndarray]:
+    """Per-transect (lon, lat) point at which to sample ocean forcing / depth.
+
+    Returns the point a fraction ``seaward_frac`` of the way along each
+    transect: 0.0 = the origin (on the inland baseline), 1.0 = the seaward
+    end. Ocean fields (sea level, currents, waves) and seafloor depth must be
+    sampled in open water *seaward* of the shoreline, NOT at the inland
+    baseline origin (which lands on or behind the beach and, for ocean
+    products, on land-masked cells). Each transect gets its own (lon, lat),
+    so this preserves along-shore variation.
+    """
+    ox = transects["origin_x"].values
+    oy = transects["origin_y"].values
+    ex = transects["end_x"].values
+    ey = transects["end_y"].values
+    sx = ox + seaward_frac * (ex - ox)
+    sy = oy + seaward_frac * (ey - oy)
+    return utm_to_lonlat(sx, sy, utm_zone)
+
+
 def clamp_query_to_data_range(
     query_lons: np.ndarray,
     query_lats: np.ndarray,
@@ -112,6 +137,20 @@ def safe_interp(
     # .values forces computation (for dask); .any() short-circuits on first True
     if not result.isnull().values.any():
         return result
+
+    # Linear has NaNs — likely the query points land on the coarse product's
+    # land-masked cells. Warn when this is widespread: nearest-fill collapses
+    # along-shore variation, the opposite of the per-transect design's goal.
+    nan_frac = float(np.isnan(np.asarray(result.values)).mean())
+    if nan_frac > 0.30:
+        import warnings
+        warnings.warn(
+            f"[interp] linear interpolation returned NaN for {nan_frac:.0%} of "
+            f"sampled cells (land mask / too-coarse grid); falling back to "
+            f"nearest. Along-shore forcing variation is reduced — check that "
+            f"sample points sit in open water.",
+            stacklevel=2,
+        )
 
     # Linear has NaNs — try nearest
     result = var.interp(longitude=lon_pts, latitude=lat_pts, method="nearest")

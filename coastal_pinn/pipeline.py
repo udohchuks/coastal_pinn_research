@@ -40,7 +40,6 @@ from coastal_pinn.sources.bathymetry import fetch_bathymetry
 from coastal_pinn.sources.sea_level import fetch_sea_level
 from coastal_pinn.sources.wave_intensity import fetch_wave_intensity
 from coastal_pinn.sources.shoreline import fetch_shorelines
-from coastal_pinn.sources.sediment_recovery import compute_sediment_recovery
 from coastal_pinn.sources.transects import generate_transects
 
 
@@ -270,15 +269,12 @@ def reconcile(cfg: PipelineConfig,
         shore_normal_deg=sn_per_row,
     )
 
-    # R_sediment_m_yr is currently NaN (not implemented)
-    try:
-        dates_index = pd.DatetimeIndex(merged["timestamp"].unique())
-        r_series = compute_sediment_recovery(cfg, dates_index)
-        merged["R_sediment_m_yr"] = merged["timestamp"].map(
-            lambda ts: r_series.get(ts, np.nan)
-        )
-    except NotImplementedError:
-        merged["R_sediment_m_yr"] = np.nan
+    # R_sediment_m_yr is left NaN by design: per data.md §7-8, sediment
+    # recovery is NOT fabricated from a proxy — the PINN learns it as a
+    # non-negative neural closure R_theta(h, u, W, depth, t). A physics
+    # proxy estimator exists in sources/sediment_recovery.py for comparison,
+    # but it is intentionally NOT wired into the canonical training table.
+    merged["R_sediment_m_yr"] = np.nan
 
     # Drop rows with missing required inputs
     n_total = len(merged)

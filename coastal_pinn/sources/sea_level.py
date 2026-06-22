@@ -150,39 +150,67 @@ def _download_sea_level(cfg: PipelineConfig, creds: tuple[str, str], out_path: P
     end_dt = cfg.t_end_dt
     cutoff = pd.Timestamp("2022-06-01", tz="UTC")
 
-    REANALYSIS_ID = "cmems_mod_glo_phy_my_0.083deg_P1D-m"
-    ANALYSIS_ID = "cmems_mod_glo_phy_anfc_0.083deg_P1D-m"
-    variables = ["zos", "uo", "vo"]
+    def _fetch_product(product_type: str, dt_start, dt_end, p_out: Path):
+        if product_type == "reanalysis":
+            copernicusmarine.subset(
+                dataset_id="cmems_mod_glo_phy_my_0.083deg_P1D-m",
+                variables=["zos", "uo", "vo"],
+                minimum_longitude=lon_min, maximum_longitude=lon_max,
+                minimum_latitude=lat_min,  maximum_latitude=lat_max,
+                start_datetime=dt_start.strftime("%Y-%m-%dT%H:%M:%S"),
+                end_datetime=dt_end.strftime("%Y-%m-%dT%H:%M:%S"),
+                output_filename=str(p_out),
+                username=user, password=pwd,
+            )
+        else:
+            p_ssh = p_out.with_suffix(".ssh.nc")
+            p_cur = p_out.with_suffix(".cur.nc")
+            for p in (p_ssh, p_cur):
+                if p.exists(): p.unlink()
+            copernicusmarine.subset(
+                dataset_id="cmems_mod_glo_phy_anfc_0.083deg_P1D-m",
+                variables=["zos"],
+                minimum_longitude=lon_min, maximum_longitude=lon_max,
+                minimum_latitude=lat_min,  maximum_latitude=lat_max,
+                start_datetime=dt_start.strftime("%Y-%m-%dT%H:%M:%S"),
+                end_datetime=dt_end.strftime("%Y-%m-%dT%H:%M:%S"),
+                output_filename=str(p_ssh),
+                username=user, password=pwd,
+            )
+            copernicusmarine.subset(
+                dataset_id="cmems_mod_glo_phy-cur_anfc_0.083deg_P1D-m",
+                variables=["uo", "vo"],
+                minimum_longitude=lon_min, maximum_longitude=lon_max,
+                minimum_latitude=lat_min,  maximum_latitude=lat_max,
+                start_datetime=dt_start.strftime("%Y-%m-%dT%H:%M:%S"),
+                end_datetime=dt_end.strftime("%Y-%m-%dT%H:%M:%S"),
+                output_filename=str(p_cur),
+                username=user, password=pwd,
+            )
+            ds_ssh = xr.open_dataset(p_ssh)
+            ds_cur = xr.open_dataset(p_cur)
+            try:
+                merged = xr.merge([ds_ssh, ds_cur])
+                merged.to_netcdf(p_out)
+            finally:
+                ds_ssh.close()
+                ds_cur.close()
+                for p in (p_ssh, p_cur):
+                    try: p.unlink()
+                    except OSError: pass
 
     spans_cutoff = (start_dt < cutoff) and (end_dt > cutoff)
 
     if spans_cutoff:
-        # Two-stage download: reanalysis for [start, cutoff], analysis for [cutoff, end]
         part1 = out_path.with_suffix(".part1.nc")
         part2 = out_path.with_suffix(".part2.nc")
         for p in (part1, part2):
             if p.exists():
                 p.unlink()
-        copernicusmarine.subset(
-            dataset_id=REANALYSIS_ID,
-            variables=variables,
-            minimum_longitude=lon_min, maximum_longitude=lon_max,
-            minimum_latitude=lat_min,  maximum_latitude=lat_max,
-            start_datetime=start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-            end_datetime=cutoff.strftime("%Y-%m-%dT%H:%M:%S"),
-            output_filename=str(part1),
-            username=user, password=pwd,
-        )
-        copernicusmarine.subset(
-            dataset_id=ANALYSIS_ID,
-            variables=variables,
-            minimum_longitude=lon_min, maximum_longitude=lon_max,
-            minimum_latitude=lat_min,  maximum_latitude=lat_max,
-            start_datetime=cutoff.strftime("%Y-%m-%dT%H:%M:%S"),
-            end_datetime=end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-            output_filename=str(part2),
-            username=user, password=pwd,
-        )
+        
+        _fetch_product("reanalysis", start_dt, cutoff, part1)
+        _fetch_product("analysis", cutoff, end_dt, part2)
+        
         # Merge along time dimension
         ds1 = xr.open_dataset(part1)
         ds2 = xr.open_dataset(part2)
@@ -199,17 +227,9 @@ def _download_sea_level(cfg: PipelineConfig, creds: tuple[str, str], out_path: P
                 try: p.unlink()
                 except OSError: pass
     else:
-        dataset_id = REANALYSIS_ID if start_dt < cutoff else ANALYSIS_ID
-        copernicusmarine.subset(
-            dataset_id=dataset_id,
-            variables=variables,
-            minimum_longitude=lon_min, maximum_longitude=lon_max,
-            minimum_latitude=lat_min,  maximum_latitude=lat_max,
-            start_datetime=start_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-            end_datetime=end_dt.strftime("%Y-%m-%dT%H:%M:%S"),
-            output_filename=str(tmp_path),
-            username=user, password=pwd,
-        )
+        product_type = "reanalysis" if start_dt < cutoff else "analysis"
+        _fetch_product(product_type, start_dt, end_dt, tmp_path)
+        
     os.replace(tmp_path, out_path)
 
 
@@ -229,19 +249,13 @@ def _to_dataframe(ds: xr.Dataset, cfg: PipelineConfig) -> pd.DataFrame:
             raise SourceUnavailable("sea_level",
                 f"missing variable {v!r} in cached dataset (vars={list(ds.data_vars)})")
 
-    # Generate transects in lon/lat for xarray interp
+    # Sample ocean fields at each transect's seaward end (open water), NOT at
+    # the inland baseline origin. Sampling at the baseline lands on/behind the
+    # beach where the ocean product is land-masked; the seaward point gives the
+    # real nearshore value and preserves along-shore variation per transect.
     transects_df = generate_transects(cfg.region)
-    transects_ll = transects_to_lonlat(transects_df, cfg.region.utm_zone)
-    # Use the baseline latitude (not the per-transect lat) for the query,
-    # since UTM-to-lonlat conversion introduces small floating-point drift
-    # that puts per-transect lats slightly outside the data's discrete lat
-    # grid. The baseline lat is exact and within the data range.
-    if cfg.region.baseline is not None and len(cfg.region.baseline) >= 1:
-        baseline_lat = float(cfg.region.baseline[0][1])
-    else:
-        baseline_lat = float(transects_ll["origin_lat"].values[0])
-    raw_lons = transects_ll["origin_lon"].values
-    raw_lats = np.full(len(transects_df), baseline_lat)
+    from coastal_pinn.core.coords import transect_sample_points
+    raw_lons, raw_lats = transect_sample_points(transects_df, cfg.region.utm_zone)
     # Clamp to data range to avoid NaN at boundaries from float drift
     from coastal_pinn.core.coords import clamp_query_to_data_range
     clamped_lons, clamped_lats = clamp_query_to_data_range(raw_lons, raw_lats, ds)

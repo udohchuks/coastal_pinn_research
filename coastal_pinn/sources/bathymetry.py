@@ -119,15 +119,11 @@ def _extract_per_transect(ds: xr.Dataset, cfg: PipelineConfig) -> pd.DataFrame:
         raise SourceUnavailable("bathymetry",
             f"could not find depth variable in dataset; data_vars={list(ds.data_vars)}")
 
+    # Sample seafloor depth at each transect's seaward end (nearshore, in the
+    # water), not at the inland baseline origin (which returns land elevation).
     transects_df = generate_transects(cfg.region)
-    transects_ll = transects_to_lonlat(transects_df, cfg.region.utm_zone)
-
-    if cfg.region.baseline is not None and len(cfg.region.baseline) >= 1:
-        baseline_lat = float(cfg.region.baseline[0][1])
-    else:
-        baseline_lat = float(transects_ll["origin_lat"].values[0])
-    raw_lons = transects_ll["origin_lon"].values
-    raw_lats = np.full(len(transects_df), baseline_lat)
+    from coastal_pinn.core.coords import transect_sample_points
+    raw_lons, raw_lats = transect_sample_points(transects_df, cfg.region.utm_zone)
     from coastal_pinn.core.coords import clamp_query_to_data_range, safe_interp
     clamped_lons, clamped_lats = clamp_query_to_data_range(raw_lons, raw_lats, ds)
     lon_pts = xr.DataArray(clamped_lons, dims="points")
@@ -144,4 +140,19 @@ def _extract_per_transect(ds: xr.Dataset, cfg: PipelineConfig) -> pd.DataFrame:
     # Fill any NaN with the regional mean (defensive)
     if df["depth_m"].isna().any():
         df["depth_m"] = df["depth_m"].fillna(df["depth_m"].mean())
+
+    # Guard: GEBCO depth is elevation relative to MSL (negative = seafloor).
+    # A high fraction of POSITIVE values means we are sampling on land, which
+    # signals a geometry error (baseline placement / ocean_side / transect
+    # length so the seaward sample point never reaches the water).
+    import warnings
+    pos_frac = float((df["depth_m"] > 0).mean())
+    if pos_frac > 0.20:
+        warnings.warn(
+            f"[bathymetry] {pos_frac:.0%} of transects have positive depth_m "
+            f"(above MSL = land). The seaward sample point is likely on land — "
+            f"check region.baseline placement, region.ocean_side, and "
+            f"transect_length_m.",
+            stacklevel=2,
+        )
     return df.reset_index(drop=True)

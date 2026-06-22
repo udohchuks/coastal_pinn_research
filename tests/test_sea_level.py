@@ -95,6 +95,6 @@ def test_sea_level_depth_collapse_averaging(keta_config):
     df = _to_dataframe(ds, keta_config)
     # depth is collapsed to mean 15.0 before per-transect interpolation
     # All transects should get 15.0 (query lons are clamped to data range)
-    assert (df["h_m"] == 15.0).all()
-    assert (df["u_east_m_s"] == 15.0).all()
-    assert (df["u_north_m_s"] == 15.0).all()
+    assert np.allclose(df["h_m"], 15.0)
+    assert np.allclose(df["u_east_m_s"], 15.0)
+    assert np.allclose(df["u_north_m_s"], 15.0)

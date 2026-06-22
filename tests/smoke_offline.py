@@ -26,9 +26,9 @@ sys.path.insert(0, str(ROOT))
 
 from coastal_pinn import PipelineConfig, REGIONS
 from coastal_pinn.pipeline import reconcile
-from coastal_pinn.sources.bathymetry import _extract_points
+from coastal_pinn.sources.bathymetry import _extract_per_transect
 from coastal_pinn.sources.sea_level import _to_dataframe as sl_to_df
-from coastal_pinn.sources.shoreline import _to_dataframe as shore_to_df
+from coastal_pinn.sources.shoreline import _intersect_with_transects as shore_to_df
 from coastal_pinn.sources.wave_intensity import _to_dataframe as wv_to_df
 from coastal_pinn.core.io import read_csv
 from coastal_pinn.core.schema import PINN_COLUMNS, PINN_REQUIRED_COLUMNS, validate_schema
@@ -45,7 +45,7 @@ def _make_bathy(cfg: PipelineConfig, path: Path) -> pd.DataFrame:
     )
     ds.to_netcdf(path)
     ds.close()
-    return _extract_points(xr.open_dataset(path), cfg)
+    return _extract_per_transect(xr.open_dataset(path), cfg)
 
 
 def _make_sea_level(cfg: PipelineConfig, path: Path) -> pd.DataFrame:
@@ -79,10 +79,10 @@ def _make_waves(cfg: PipelineConfig, path: Path) -> pd.DataFrame:
     rng = np.random.default_rng(1)
     ds = xr.Dataset(
         {
-            "shgt": (("time", "latitude", "longitude"),
+            "VHM0": (("time", "latitude", "longitude"),
                      (1.0 + 0.3 * rng.standard_normal(times.size * lats.size * lons.size)
                       .reshape(times.size, lats.size, lons.size)).astype("float32")),
-            "mwd":  (("time", "latitude", "longitude"),
+            "VMDR": (("time", "latitude", "longitude"),
                      (200 + 20 * rng.standard_normal(times.size * lats.size * lons.size)
                       .reshape(times.size, lats.size, lons.size)).astype("float32")),
         },
@@ -98,11 +98,18 @@ def _make_shoreline(cfg: PipelineConfig, path: Path) -> pd.DataFrame:
     # 41 cloud-free dates across 2018 (matches the ~40/yr figure in the PDF)
     dates = pd.date_range("2018-01-01", "2018-12-31", freq="9D", tz="UTC")
     sh = {"dates": list(dates), "shorelines": [], "satname": ["S2"] * len(dates)}
+    from coastal_pinn.core.coords import lonlat_to_utm
+    # Synthetic shoreline ~200 m seaward (south) of a stretch of the onshore
+    # baseline, so south-pointing transects intersect it. Converted to UTM
+    # since CoastSat returns polylines in output_epsg = region.epsg.
+    base = np.array(cfg.region.baseline)[15:45]
+    lat_shift = 200.0 / 111_000.0
     for _ in dates:
-        npts = 30
-        lons = 1.05 + np.linspace(-0.005, 0.005, npts) + rng.normal(0, 0.0002, npts)
-        lats = 5.95 + np.linspace(-0.001, 0.001, npts) + rng.normal(0, 0.0002, npts)
-        sh["shorelines"].append(np.column_stack([lons, lats]))
+        jitter = rng.normal(0, 0.0002, base.shape)
+        lons = base[:, 0] + jitter[:, 0]
+        lats = base[:, 1] - lat_shift + jitter[:, 1]
+        x, y = lonlat_to_utm(lons, lats, cfg.region.utm_zone)
+        sh["shorelines"].append(np.column_stack([x, y]))
     import pickle
     with open(path, "wb") as f:
         pickle.dump(sh, f)

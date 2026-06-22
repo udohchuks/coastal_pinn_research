@@ -122,21 +122,25 @@ def real_shape_shoreline_pkl(tmp_path: Path) -> Path:
     """Write a pickle of CoastSat output dict (real shape).
 
     Polylines are in UTM (output_epsg=32631), as the production fetcher
-    sets `output_epsg = cfg.region.epsg`. The polylines are positioned
-    at the Keta coast (UTM northing ~657k for lat=5.95), which is
-    within the 15-km transect reach from the inland baseline at lat=6.05.
+    sets `output_epsg = cfg.region.epsg`. The synthetic shoreline is built
+    ~200 m seaward (south) of a contiguous stretch of the Keta onshore
+    baseline, so the south-pointing transects intersect it at S ~200 m
+    (well within the 750-m transect reach).
     """
     import pickle
+    from coastal_pinn import REGIONS
     from coastal_pinn.core.coords import lonlat_to_utm
     path = tmp_path / "shoreline_fixture.pkl"
     rng = np.random.default_rng(7)
     dates = pd.date_range("2018-01-04", periods=5, freq="9D", tz="UTC")
     sh = {"dates": list(dates), "shorelines": [], "satname": ["S2"] * len(dates)}
+    # A contiguous along-shore stretch of the baseline, shifted ~200 m south.
+    base = np.array(REGIONS["keta"].baseline)[15:45]
+    lat_shift = 200.0 / 111_000.0  # ~200 m in degrees latitude
     for _ in dates:
-        npts = 30
-        # Generate in lon/lat at the Keta coast, then convert to UTM
-        lons = 1.05 + np.linspace(-0.005, 0.005, npts) + rng.normal(0, 0.0002, npts)
-        lats = 5.95 + np.linspace(-0.001, 0.001, npts) + rng.normal(0, 0.0002, npts)
+        jitter = rng.normal(0, 0.0002, base.shape)
+        lons = base[:, 0] + jitter[:, 0]
+        lats = base[:, 1] - lat_shift + jitter[:, 1]
         x, y = lonlat_to_utm(lons, lats, "31N")
         sh["shorelines"].append(np.column_stack([x, y]))
     with open(path, "wb") as f:

@@ -47,6 +47,30 @@ def _bbox_center_lat(region: Region) -> float:
     return (region.bbox[1] + region.bbox[3]) / 2.0
 
 
+def _orient_to_ocean(perp: np.ndarray, ocean_side: str) -> np.ndarray:
+    """Flip a perpendicular (dx_east, dy_north) so it points toward the ocean.
+
+    ocean_side is a cardinal direction: the side of the coast on which the
+    open ocean lies. This is robust for diagonal coastlines, where the
+    "perpendicular toward bbox-center latitude" heuristic can point inland.
+    """
+    side = ocean_side.lower()
+    dx, dy = float(perp[0]), float(perp[1])
+    if side == "south":
+        want = dy < 0          # negative northing
+    elif side == "north":
+        want = dy > 0
+    elif side == "east":
+        want = dx > 0
+    elif side == "west":
+        want = dx < 0
+    else:
+        raise ValueError(
+            f"invalid ocean_side {ocean_side!r}; expected north/south/east/west"
+        )
+    return perp if want else -perp
+
+
 def _shore_normal_for_baseline(
     region: Region, baseline_utm: np.ndarray
 ) -> tuple[np.ndarray, np.ndarray]:
@@ -66,7 +90,11 @@ def _shore_normal_for_baseline(
     # Two perpendiculars: rotate +90 and -90
     perp_a = np.array([-tangent[1], tangent[0]])
     perp_b = np.array([tangent[1], -tangent[0]])
-    # Pick the one pointing toward the bbox center latitude
+    # If the region declares which side the ocean is on, use it (robust).
+    if region.ocean_side is not None:
+        oriented = _orient_to_ocean(perp_a, region.ocean_side)
+        return oriented[0], oriented[1]
+    # Otherwise pick the one pointing toward the bbox center latitude.
     # Convert center lat/lon to UTM for consistent units
     center_lon = (region.bbox[0] + region.bbox[2]) / 2.0
     center_lat = _bbox_center_lat(region)
@@ -136,12 +164,17 @@ def generate_transects(region: Region) -> pd.DataFrame:
             origins[i] = baseline_utm[seg_idx] + offset_in_seg * local_t
             # Perpendicular at this point
             local_perp = np.array([-local_t[1], local_t[0]])
-            mid_lat = (baseline_utm[seg_idx, 1] + baseline_utm[seg_idx + 1, 1]) / 2.0
-            if (local_perp[1] > 0 and mid_lat > center_lat) or \
-               (local_perp[1] < 0 and mid_lat < center_lat):
-                pass  # already points toward center (seaward)
+            if region.ocean_side is not None:
+                # Explicit ocean side: robust for diagonal coasts.
+                local_perp = _orient_to_ocean(local_perp, region.ocean_side)
             else:
-                local_perp = -local_perp
+                # Legacy heuristic: orient toward bbox-center latitude.
+                mid_lat = (baseline_utm[seg_idx, 1] + baseline_utm[seg_idx + 1, 1]) / 2.0
+                if (local_perp[1] > 0 and mid_lat > center_lat) or \
+                   (local_perp[1] < 0 and mid_lat < center_lat):
+                    pass  # already points toward center (seaward)
+                else:
+                    local_perp = -local_perp
             per_shore_normal[i] = math.degrees(math.atan2(local_perp[1], local_perp[0])) % 360.0
         along_shore_x = s_vals
         # For N-point baselines, transect ends use per-transect shore normals

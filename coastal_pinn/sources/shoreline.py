@@ -121,6 +121,18 @@ def fetch_shorelines(cfg: PipelineConfig) -> pd.DataFrame:
     if not cfg.shoreline_enabled:
         raise SourceUnavailable("shoreline", "disabled in config")
 
+    # Fast path: the per-transect intersected table is already cached. This
+    # skips BOTH the (slow) CoastSat download and the per-transect
+    # intersection, which otherwise re-runs on every call.
+    #
+    # NB: this cache is keyed only by region + time window, NOT by transect
+    # geometry. If you change region.baseline / transect_spacing_m /
+    # transect_length_m, delete the *.transects.pkl file to force a rebuild.
+    intersected_cache = data_path(cfg, "shoreline", suffix="transects.pkl")
+    if intersected_cache.exists():
+        print("[shoreline       ] intersected-table cache hit, loading...", flush=True)
+        return read_pickle(intersected_cache)
+
     cache = data_path(cfg, "shoreline", suffix="pkl")
     if cache.exists():
         print("[shoreline       ] cache hit, intersecting with transects...", flush=True)
@@ -145,7 +157,11 @@ def fetch_shorelines(cfg: PipelineConfig) -> pd.DataFrame:
 
     print(f"[shoreline       ] intersecting {len(shoreline_dict.get('dates', []))} "
           "dates with transects...", flush=True)
-    return _intersect_with_transects(shoreline_dict, cfg)
+    df = _intersect_with_transects(shoreline_dict, cfg)
+    write_pickle_atomic(df, intersected_cache)
+    print(f"[shoreline       ] cached intersected table ({len(df)} rows) "
+          f"-> {intersected_cache.name}", flush=True)
+    return df
 
 
 def _download_shorelines(cfg: PipelineConfig) -> dict[str, Any]:
@@ -355,6 +371,7 @@ def _intersect_with_transects(shoreline_dict: dict[str, Any],
         shoreline_dict, transects_df, cfg
     )
     if use_coastsat_intersect is not None:
+        _warn_if_low_intersection(use_coastsat_intersect, n_transects)
         return use_coastsat_intersect
 
     # Shapely fallback: per-transect intersection for each (date, polyline)
@@ -386,8 +403,30 @@ def _intersect_with_transects(shoreline_dict: dict[str, Any],
 
     df = pd.DataFrame(rows)
     df["region"] = cfg.region.name
+    _warn_if_low_intersection(df, n_transects)
     return df[["region", "timestamp", "transect_id", "along_shore_x_m",
                "cross_shore_S_m", "sat"]]
+
+
+def _warn_if_low_intersection(df: pd.DataFrame, n_transects: int) -> None:
+    """Warn if few transects intersect the shoreline (geometry mismatch).
+
+    A low hit rate means the baseline is mis-placed relative to the detected
+    shoreline, the transects point the wrong way, or they are too short — i.e.
+    the kind of error that yields an empty/degenerate training label.
+    """
+    import warnings
+    if df.empty or n_transects == 0:
+        return
+    hit_frac = df["transect_id"].nunique() / n_transects
+    if hit_frac < 0.50:
+        warnings.warn(
+            f"[shoreline] only {hit_frac:.0%} of {n_transects} transects "
+            f"intersect the shoreline. Likely a geometry mismatch: check "
+            f"region.baseline placement, region.ocean_side, and "
+            f"transect_length_m.",
+            stacklevel=2,
+        )
 
 
 def _try_use_coastsat_intersect(shoreline_dict, transects_df, cfg):

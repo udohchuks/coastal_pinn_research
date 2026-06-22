@@ -26,7 +26,7 @@ from coastal_pinn import PipelineConfig, REGIONS
 from coastal_pinn.pipeline import reconcile
 from coastal_pinn.sources.bathymetry import _extract_per_transect
 from coastal_pinn.sources.sea_level import _to_dataframe as sl_to_df
-from coastal_pinn.sources.shoreline import _to_dataframe as shore_to_df
+from coastal_pinn.sources.shoreline import _intersect_with_transects as shore_to_df
 from coastal_pinn.sources.wave_intensity import _to_dataframe as wv_to_df
 
 
@@ -83,10 +83,10 @@ def _make_waves(cfg: PipelineConfig, path: Path) -> pd.DataFrame:
     rng = np.random.default_rng(1)
     ds = xr.Dataset(
         {
-            "shgt": (("time", "latitude", "longitude"),
+            "VHM0": (("time", "latitude", "longitude"),
                      (1.0 + 0.3 * rng.standard_normal(times.size * lats.size * lons.size)
                       .reshape(times.size, lats.size, lons.size)).astype("float32")),
-            "mwd":  (("time", "latitude", "longitude"),
+            "VMDR": (("time", "latitude", "longitude"),
                      (200 + 20 * rng.standard_normal(times.size * lats.size * lons.size)
                       .reshape(times.size, lats.size, lons.size)).astype("float32")),
         },
@@ -105,11 +105,18 @@ def _make_shoreline(cfg: PipelineConfig, path: Path) -> pd.DataFrame:
     rng = np.random.default_rng(7)
     dates = pd.date_range(cfg.t_start, cfg.t_end, freq="9D", tz="UTC")
     sh = {"dates": list(dates), "shorelines": [], "satname": ["S2"] * len(dates)}
+    from coastal_pinn.core.coords import lonlat_to_utm
+    # Synthetic shoreline ~200 m seaward (south) of a stretch of the onshore
+    # baseline so the south-pointing transects intersect it; UTM since
+    # CoastSat returns polylines in output_epsg = region.epsg.
+    base = np.array(cfg.region.baseline)[15:45]
+    lat_shift = 200.0 / 111_000.0
     for _ in dates:
-        npts = 30
-        lons = 1.05 + np.linspace(-0.005, 0.005, npts) + rng.normal(0, 0.0002, npts)
-        lats = 5.95 + np.linspace(-0.001, 0.001, npts) + rng.normal(0, 0.0002, npts)
-        sh["shorelines"].append(np.column_stack([lons, lats]))
+        jitter = rng.normal(0, 0.0002, base.shape)
+        lons = base[:, 0] + jitter[:, 0]
+        lats = base[:, 1] - lat_shift + jitter[:, 1]
+        x, y = lonlat_to_utm(lons, lats, cfg.region.utm_zone)
+        sh["shorelines"].append(np.column_stack([x, y]))
     import pickle
     with open(path, "wb") as f:
         pickle.dump(sh, f)
@@ -117,7 +124,10 @@ def _make_shoreline(cfg: PipelineConfig, path: Path) -> pd.DataFrame:
 
 
 if __name__ == "__main__":
-    cache_root = ROOT / "coastal_research_ashesi"
+    # Use a dedicated throwaway cache root so this smoke run can never wipe
+    # the real download cache (coastal_research_ashesi/), which may hold
+    # hours of real CoastSat/Copernicus downloads.
+    cache_root = ROOT / "coastal_research_ashesi_smoke"
     if cache_root.exists():
         shutil.rmtree(cache_root)
 

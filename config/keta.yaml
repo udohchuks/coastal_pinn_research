@@ -1,19 +1,80 @@
 region:
   name: keta
-  bbox: [0.80, 5.85, 1.40, 6.10]
+  # bbox covers the real Atlantic shoreline (NE-trending, Volta estuary
+  # in the SW to Aflao/Togo border in the NE). Matches the eastern-Ghana
+  # study area of Asare-Bediako et al. 2025 (Sci Rep 15:33032).
+  bbox: [0.85, 5.74, 1.24, 6.15]
   utm_zone: 31N
-  # Inland baseline parallel to the Keta coast (which runs roughly
-  # east-west at lat ~5.95). The baseline is set ~0.10 deg inland
-  # (lat ~6.05) so x=0 is inland and transects extend seaward.
+  # The open Atlantic lies SOUTH of the coast; transects point seaward (S).
+  ocean_side: south
+  # Onshore baseline (~150 m inland of the OSM Atlantic coastline),
+  # following the NE-trending shore. Derived by scripts/derive_keta_baseline.py
+  # from data/keta_baseline.json. Transects are cast seaward from it.
   baseline:
-    - [1.40, 6.05]
-    - [0.80, 6.05]
-  # DSAS default along-shore transect spacing
-  transect_spacing_m: 100
-  # Cross-shore transect length: Keta's baseline is ~11 km inland of
-  # the coast, so transects must be long enough to span the full
-  # distance. 15 km gives margin past the actual shoreline.
-  transect_length_m: 15000
+    - [0.8663, 5.7807]
+    - [0.8724, 5.7813]
+    - [0.8780, 5.7820]
+    - [0.8838, 5.7825]
+    - [0.8896, 5.7828]
+    - [0.8958, 5.7833]
+    - [0.9017, 5.7841]
+    - [0.9084, 5.7850]
+    - [0.9137, 5.7857]
+    - [0.9201, 5.7870]
+    - [0.9252, 5.7883]
+    - [0.9317, 5.7917]
+    - [0.9381, 5.7960]
+    - [0.9438, 5.8001]
+    - [0.9495, 5.8058]
+    - [0.9555, 5.8115]
+    - [0.9611, 5.8171]
+    - [0.9674, 5.8240]
+    - [0.9727, 5.8304]
+    - [0.9791, 5.8406]
+    - [0.9847, 5.8523]
+    - [0.9922, 5.9120]
+    - [0.9952, 5.9273]
+    - [1.0030, 5.9424]
+    - [1.0089, 5.9514]
+    - [1.0139, 5.9602]
+    - [1.0211, 5.9716]
+    - [1.0265, 5.9784]
+    - [1.0325, 5.9872]
+    - [1.0389, 5.9964]
+    - [1.0447, 6.0045]
+    - [1.0501, 6.0122]
+    - [1.0562, 6.0197]
+    - [1.0616, 6.0259]
+    - [1.0685, 6.0345]
+    - [1.0742, 6.0406]
+    - [1.0803, 6.0472]
+    - [1.0867, 6.0524]
+    - [1.0921, 6.0566]
+    - [1.0982, 6.0610]
+    - [1.1049, 6.0651]
+    - [1.1103, 6.0691]
+    - [1.1172, 6.0743]
+    - [1.1230, 6.0776]
+    - [1.1293, 6.0809]
+    - [1.1352, 6.0849]
+    - [1.1408, 6.0876]
+    - [1.1464, 6.0914]
+    - [1.1532, 6.0936]
+    - [1.1589, 6.0965]
+    - [1.1654, 6.0996]
+    - [1.1714, 6.1019]
+    - [1.1774, 6.1048]
+    - [1.1828, 6.1068]
+    - [1.1884, 6.1091]
+    - [1.1954, 6.1122]
+    - [1.2008, 6.1142]
+    - [1.2072, 6.1165]
+    - [1.2132, 6.1188]
+    - [1.2191, 6.1204]
+  # DSAS-style spacing/length (paper uses 50 m / 500 m; 750 m gives margin
+  # for shoreline excursion past the onshore baseline).
+  transect_spacing_m: 50
+  transect_length_m: 750
 
 time:
   start: 2018-01-01
@@ -40,3 +101,4 @@ sources:
     enabled: true
     gee_project: igem2026
     sitename: Keta
+    save_qc: false

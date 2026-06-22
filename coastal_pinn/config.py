@@ -44,6 +44,11 @@ class Region:
     baseline: tuple[tuple[float, float], ...] | None = None
     transect_spacing_m: float = 100.0
     transect_length_m: float = 500.0
+    # Cardinal direction of the open ocean relative to the coast
+    # ('north'|'south'|'east'|'west'). Used to orient transects seaward.
+    # Robust for diagonal coastlines where the "toward bbox-center"
+    # heuristic fails. If None, the legacy bbox-center heuristic is used.
+    ocean_side: str | None = None
 
     def lon_min(self) -> float: return self.bbox[0]
     def lat_min(self) -> float: return self.bbox[1]
@@ -135,19 +140,33 @@ class PipelineConfig:
 # Default regions. Users can extend by importing and adding to REGIONS
 # from their own config, or by editing this dict directly.
 
+def _load_keta_baseline() -> tuple[tuple[float, float], ...] | None:
+    """Load the Keta onshore baseline polyline from the bundled data file.
+
+    Single source of truth shared with config/keta.yaml. Regenerate both via
+    scripts/derive_keta_baseline.py. Returns None if the file is missing.
+    """
+    import json
+    p = Path(__file__).resolve().parent.parent / "data" / "keta_baseline.json"
+    if not p.exists():
+        return None
+    pts = json.loads(p.read_text(encoding="utf-8"))
+    return tuple((float(a), float(b)) for a, b in pts)
+
+
 REGIONS: dict[str, Region] = {
+    # Keta, eastern Ghana. Geometry follows the OSM Atlantic coastline (the
+    # coast runs NE from the Volta estuary toward Aflao) — NOT the inland Keta
+    # Lagoon. The baseline sits ~150 m onshore; transects point seaward (south)
+    # toward the open Atlantic. See data.md and scripts/derive_keta_baseline.py.
     "keta": Region(
         name="keta",
-        bbox=(0.80, 5.85, 1.40, 6.10),
+        bbox=(0.85, 5.74, 1.24, 6.15),
         utm_zone="31N",
-        # Inland baseline parallel to the Keta coast (which runs roughly
-        # east-west at lat ~5.95). The baseline is set ~0.10 deg inland
-        # (lat ~6.05) so x=0 is inland and transects extend seaward.
-        baseline=((1.40, 6.05), (0.80, 6.05)),
-        transect_spacing_m=100.0,
-        # Keta's baseline is ~11 km inland of the coast, so transects
-        # must be at least 15 km long to span the full distance with margin.
-        transect_length_m=15000.0,
+        baseline=_load_keta_baseline(),
+        transect_spacing_m=50.0,
+        transect_length_m=750.0,
+        ocean_side="south",
     ),
 }
 
@@ -206,6 +225,8 @@ def _raw_to_config(raw: dict[str, Any], source: str = "<dict>") -> PipelineConfi
 
     transect_spacing_m = float(region_raw.get("transect_spacing_m", 100.0))
     transect_length_m = float(region_raw.get("transect_length_m", 500.0))
+    ocean_side = region_raw.get("ocean_side")
+    ocean_side = str(ocean_side) if ocean_side is not None else None
 
     region = Region(
         name=str(region_raw["name"]),
@@ -214,6 +235,7 @@ def _raw_to_config(raw: dict[str, Any], source: str = "<dict>") -> PipelineConfi
         baseline=baseline,
         transect_spacing_m=transect_spacing_m,
         transect_length_m=transect_length_m,
+        ocean_side=ocean_side,
     )
 
     time_raw = raw["time"]
@@ -267,6 +289,7 @@ def init_config_yaml(region: Region, out_path: str | Path) -> None:
             "utm_zone": region.utm_zone,
             "transect_spacing_m": region.transect_spacing_m,
             "transect_length_m": region.transect_length_m,
+            **({"ocean_side": region.ocean_side} if region.ocean_side else {}),
         },
         "time": {
             "start": "2018-01-01",

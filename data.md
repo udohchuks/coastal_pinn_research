@@ -28,13 +28,15 @@ The study site is the Keta coastline in southeastern Ghana, on the Gulf of Guine
 
 | Parameter | Value |
 |---|---|
-| Bounding box | lon 0.80°E to 1.40°E, lat 5.85°N to 6.10°N |
+| Bounding box | lon 0.85°E to 1.24°E, lat 5.74°N to 6.15°N |
 | UTM zone | 31N (EPSG:32631) |
-| Coastline orientation | Approximately east-west, with land to the north and sea to the south |
-| Observed erosion rate | −7.68 m/yr (2018–2025, from 372 cloud-free satellite observations) |
-| Coastline length | ~66 km (the along-shore span of the transect array) |
+| Coastline orientation | **NE-trending** (the Atlantic coast runs from the Volta estuary in the SW up toward the Aflao/Togo border in the NE), with land to the NW and the open Atlantic to the SE/south |
+| Observed erosion rate | severe; the eastern-Ghana DSAS study reports up to ≈ −10.5 m/yr in the Keta zone (Asare-Bediako et al. 2025, *Sci. Rep.* 15:33032) |
+| Coastline length | ~40 km (the along-shore span of the transect array) |
 
-Keta is one of the most rapidly eroding coastlines in West Africa. The Volta River delta lies to the north; the coast is exposed to swell waves from the South Atlantic. The −7.68 m/yr rate confirms it as a high-intensity erosion hotspot.
+Keta is one of the most rapidly eroding coastlines in West Africa. The Volta River delta lies to the west; the coast is exposed to swell waves from the South Atlantic.
+
+**Important geographic note.** The *ocean* shoreline here is the Atlantic beach (~lat 5.78–6.12°N, rising NE with longitude), **not** the Keta Lagoon. The lagoon is a large brackish water body lying inland (north) of the barrier beach; its water boundary sits near lat 6.07°N. Because a naive ROI/baseline can cause CoastSat to lock onto the lagoon's water/land edge instead of the surf line, the study geometry is anchored to the OpenStreetMap `natural=coastline` (which marks only the sea coast). The authoritative study extent (Asare-Bediako et al. 2025) is lat 5°45′–6°10′N, lon 0°45′–1°10′E.
 
 ### Why Keta
 
@@ -103,7 +105,7 @@ The sub-pixel accuracy matters: at 30 m uncertainty (MNDWI on Landsat), the −7
 1. Download the (time, lat, lon) cube for the Keta bbox via `copernicusmarine.subset()`.
 2. If the time window spans the 2022-06-01 reanalysis/analysis cutoff, download from both products and merge along the time dimension.
 3. If the cube has a depth dimension, collapse it via mean (we use surface values).
-4. Interpolate the (lat, lon) grid to the exact (lon, lat) of each transect origin using `xarray.interp(method='linear')`. This preserves along-shore gradients — no spatial averaging.
+4. Interpolate the (lat, lon) grid to the exact (lon, lat) of each transect's **seaward sample point** (the transect's offshore end, in open water) using `xarray.interp(method='linear')`. Sampling seaward — not at the onshore baseline origin — keeps the query off land-masked cells and returns real nearshore values, while still giving each transect its own value (no spatial averaging).
 5. Compute current speed magnitude: `u_mag = sqrt(uo² + vo²)`.
 6. Resample to daily means (defensive; the product is already daily).
 7. Clamp query lon/lat to the data's coordinate range to avoid NaN at boundary transects.
@@ -122,10 +124,10 @@ The sub-pixel accuracy matters: at 30 m uncertainty (MNDWI on Landsat), the −7
 | Attribute | Value |
 |---|---|
 | Provider | EU Copernicus Marine Service |
-| Product (reanalysis) | `cmems_mod_glo_wav_my_0.083deg_PT3H-i` (multi-year, pre-2022) |
+| Product (reanalysis) | `cmems_mod_glo_wav_my_0.2deg_PT3H-i` (multi-year, pre-2022) |
 | Product (analysis) | `cmems_mod_glo_wav_anfc_0.083deg_PT3H-i` (near-real-time, post-2022) |
 | Variables | `VHM0` (significant wave height, m), `VMDR` (mean wave direction, deg meteorological) |
-| Native resolution | 0.083° (~9 km), 3-hourly |
+| Native resolution | 0.2° (~22 km) reanalysis / 0.083° (~9 km) analysis, 3-hourly |
 | Auth required | Same Copernicus credentials as PHY (shared) |
 | Cache format | `.nc` (NetCDF) |
 
@@ -208,18 +210,18 @@ The pipeline uses the standard USGS Digital Shoreline Analysis System (DSAS) con
 
 ### The baseline
 
-- **Position:** Inland, parallel to the general coastline trend.
-- **Keta baseline:** A straight line from (1.40°E, 6.05°N) to (0.80°E, 6.05°N) — an east-west line at latitude 6.05°, which is ~11 km inland of the actual coast at lat ~5.95°.
-- **Convention:** x = 0 is at the inland baseline. Transects extend seaward (south for Keta). The cross-shore distance S increases as the shoreline moves seaward (i.e., as the coast retreats).
-- **Defined in:** `config/keta.yaml` under `region.baseline`.
+- **Position:** Just *onshore* (≈150 m inland) of the Atlantic shoreline, parallel to the NE-trending coast.
+- **Keta baseline:** A 60-point polyline tracing the OSM Atlantic coastline offset ~150 m onshore, running from ~(0.87°E, 5.78°N) in the SW to ~(1.22°E, 6.12°N) in the NE. It is **derived from data, not hand-placed** — see `scripts/derive_keta_baseline.py`, which writes `data/keta_baseline.json` (the single source of truth shared by `config/keta.yaml` and `REGIONS`).
+- **Convention:** x = 0 is at the onshore baseline. Transects extend seaward (toward the open Atlantic, ~south). The cross-shore distance S increases as the shoreline moves seaward.
+- **Defined in:** `config/keta.yaml` under `region.baseline`; ocean side via `region.ocean_side: south`.
 
 ### The transects
 
-- **Count:** 665 transects for the Keta segment (66.4 km of coast at 100 m spacing).
-- **Spacing:** 100 m along-shore (DSAS default).
-- **Length:** 15 km cross-shore (long enough to span from the inland baseline past the observed shoreline with margin).
-- **Orientation:** Perpendicular to the baseline, pointing seaward. For Keta's east-west baseline, the shore-normal direction is ~270° (south).
-- **Shore-normal direction:** Computed automatically from the baseline geometry. For a straight baseline, all transects share the same shore-normal. For a curved (N-point) baseline, each transect gets its own shore-normal from the local tangent.
+- **Count:** ~1,173 transects for the Keta segment (~40 km of coast at 50 m spacing).
+- **Spacing:** 50 m along-shore (matching the DSAS setup of Asare-Bediako et al. 2025).
+- **Length:** 750 m cross-shore (the onshore baseline sits ~150 m from the shore; 750 m gives margin for shoreline excursion — far shorter than a mis-placed baseline would require).
+- **Orientation:** Perpendicular to the baseline, pointing seaward (toward the open Atlantic, which lies *south* of this coast). Orientation is set explicitly by `region.ocean_side` rather than a bbox-center heuristic, because the NE-trending coast crosses the bbox-center latitude (where the heuristic fails).
+- **Shore-normal direction:** Computed per transect from the local baseline tangent. For this curved (N-point) baseline each transect gets its own shore-normal.
 - **Generated by:** `coastal_pinn/sources/transects.py::generate_transects()`
 
 ### What each transect provides
@@ -228,7 +230,7 @@ Each transect is a line segment in UTM coordinates:
 
 | Field | Description |
 |---|---|
-| `transect_id` | Integer index, 0 to 664 |
+| `transect_id` | Integer index, 0 to ~1172 |
 | `along_shore_x_m` | Distance from the first baseline endpoint along the baseline (m). This is the spatial coordinate `x` in the PINN. |
 | `origin_x, origin_y` | UTM easting/northing of the transect origin (on the baseline) |
 | `end_x, end_y` | UTM easting/northing of the seaward end of the transect |
@@ -285,7 +287,7 @@ Sea level DataFrame: region, timestamp, transect_id, h_m, u_east_m_s, u_north_m_
 
 **Key design choices:**
 - **No spatial averaging.** The (lat, lon) cube is interpolated to each transect's exact (lon, lat). This preserves the along-shore gradient `∂h/∂x` that the PDE term needs.
-- **Baseline latitude** is used for all transect query points (not the per-transect lat), because UTM-to-lonlat conversion introduces floating-point drift that puts per-transect lats slightly outside the data's discrete lat grid.
+- **Seaward sample point** is used for every source (`core/coords.py::transect_sample_points`): ocean fields and seafloor depth are read at each transect's offshore end, in open water, not at the onshore baseline origin (which lands on/behind the beach, where ocean products are land-masked and GEBCO returns land elevation).
 - **Query clamping:** `clamp_query_to_data_range()` clips query lon/lat to the data's coordinate range, preventing NaN at boundary transects.
 
 ### Source 3: Waves (Copernicus WAM → per-transect interpolation)
@@ -376,7 +378,7 @@ The output of the pipeline is a single pandas DataFrame (written to CSV and pick
 |---|---|---|---|
 | 1 | `region` | str | Region name (e.g., `keta`) |
 | 2 | `timestamp` | datetime, UTC | Observation time |
-| 3 | `transect_id` | int | Transect index (0 to 664) |
+| 3 | `transect_id` | int | Transect index (0 to ~1172) |
 | 4 | `along_shore_x_m` | float | Transect's along-shore position from baseline origin (m) |
 | 5 | `cross_shore_S_m` | float | **Target:** observed shoreline cross-shore distance from inland baseline (m) |
 | 6 | `h_m` | float | Sea level at this transect and time (m) |
@@ -463,7 +465,7 @@ $$\mathcal{L} = \lambda_{\text{PDE}} r_{\text{PDE}}^2 + \lambda_{\text{data}} r_
 |---|---|---|
 | `r_PDE` | Violation of `∂h/∂t + u·∂h/∂x = 0` | `h_m`, `u_mag_m_s`, `along_shore_x_m`, `timestamp` |
 | `r_data` | `Ŝ(x_n, t_i) − S_obs(x_n, t_i)` | `cross_shore_S_m`, `along_shore_x_m`, `timestamp` |
-| `r_BC` | Boundary condition (zero-gradient at spatial ends) | `along_shore_x_m` at transect 0 and 664 |
+| `r_BC` | Boundary condition (zero-gradient at spatial ends) | `along_shore_x_m` at transect 0 and ~1172 |
 | `r_ODE` | Violation of `∂S/∂t − αW·sin(2θ) + βR + γ·∂²S/∂x² = 0` | `cross_shore_S_m`, `W_longshore`, `R_sediment_m_yr` (learned), `along_shore_x_m`, `timestamp` |
 | `max(0, −R)` | Negative sediment recovery (physically forbidden) | `R_sediment_m_yr` (learned) |
 
@@ -502,10 +504,10 @@ Every value in the wide table is either directly observed, directly interpolated
 
 | Source | Native cadence | Per-transect rows | Total rows (before join) |
 |---|---|---|---|
-| Shoreline (CoastSat) | ~372 cloud-free dates (irregular) | Up to 665 per date | ~55,000 intersection attempts, ~40,000 valid |
-| Sea level (PHY) | Daily, 2922 days | 665 per day | ~1.94 million |
-| Waves (WAM) | Daily (from 3-hourly), 2922 days | 665 per day | ~1.94 million |
-| Bathymetry (GEBCO) | Static | 665 (one per transect) | 665 |
+| Shoreline (CoastSat) | ~372 cloud-free dates (irregular) | Up to ~1,173 per date | intersection attempts ∝ dates × transects |
+| Sea level (PHY) | Daily, 2922 days | ~1,173 per day | ~3.4 million |
+| Waves (WAM) | Daily (from 3-hourly), 2922 days | ~1,173 per day | ~3.4 million |
+| Bathymetry (GEBCO) | Static | ~1,173 (one per transect) | ~1,173 |
 
 ### Wide table volume
 
@@ -513,12 +515,12 @@ After the as-of join with 36 h tolerance and dropping NaN rows:
 
 | Metric | Value |
 |---|---|
-| Transects | 665 |
+| Transects | ~1,173 (50 m spacing over ~40 km) |
 | Cloud-free dates | ~372 |
-| Maximum possible rows | 665 × 372 = 247,380 |
-| Expected valid rows (after drops) | ~150,000–200,000 |
+| Maximum possible rows | ~1,173 × 372 ≈ 436,000 |
+| Expected valid rows (after drops) | scales with the intersection rate (see the low-intersection guard) |
 | Columns | 12 |
-| Typical CSV size | ~10–15 MB |
+| Typical CSV size | ~20–30 MB |
 
 ### The train/val/test split
 
@@ -526,9 +528,9 @@ Time-based split (no leakage):
 
 | Split | Time range | Approx. rows |
 |---|---|---|
-| Train | 2018-01-01 to 2023-12-31 | ~130,000 (6 years × ~280 obs/yr × 665 transects) |
-| Validation | 2024-01-01 to 2024-12-31 | ~30,000 (1 year × ~50 obs × 665 transects) |
-| Test | 2025-01-01 to 2025-12-31 | ~30,000 (1 year × ~50 obs × 665 transects) |
+| Train | 2018-01-01 to 2023-12-31 | ~130,000 (6 years × ~280 obs/yr × ~1,173 transects) |
+| Validation | 2024-01-01 to 2024-12-31 | ~30,000 (1 year × ~50 obs × ~1,173 transects) |
+| Test | 2025-01-01 to 2025-12-31 | ~30,000 (1 year × ~50 obs × ~1,173 transects) |
 
 Normalization statistics (mean, std) are computed on the **training set only** and applied to val and test — this is the only correct way to prevent temporal leakage.
 
@@ -645,4 +647,4 @@ tests/
 
 ## Summary — One Paragraph
 
-We ingest four open-access data sources — GEBCO bathymetry (NOAA ERDDAP, no auth), Copernicus Marine PHY sea level and currents (`zos`, `uo`, `vo`, daily, 9 km), Copernicus Marine WAM wave forcing (`VHM0`, `VMDR`, 3-hourly, 9 km), and Google Earth Engine + CoastSat shorelines (Sentinel-2 + Landsat-8, sub-pixel, 372 cloud-free dates over 2018–2025) — cache them append-only, and reconcile them into a single per-(transect, date) wide table with a strict UTC-tz-aware 12-column schema. The spatial framework is a standard USGS DSAS One-Line Model setup: an inland baseline parallel to the Keta coast, 665 perpendicular transects at 100 m along-shore spacing, each 15 km long. All spatial sources are interpolated to the exact (lon, lat) of each transect origin — no spatial averaging — preserving along-shore gradients needed by the PDE term. The wave angle of incidence θ is computed from the wave direction and the local shore-normal, yielding the CERC longshore transport factor `W·sin(2θ)` as a derived column. Sparse temporal gaps are handled by dropping rows where forcing is missing within a 36-hour tolerance — no fabrication, no interpolation. The result is a ~150,000-row wide table covering 2018–2025 at Keta, ready to be transformed into model-ready arrays by the dataset loader and consumed by the PINN.
+We ingest four open-access data sources — GEBCO bathymetry (NOAA ERDDAP, no auth), Copernicus Marine PHY sea level and currents (`zos`, `uo`, `vo`, daily, 9 km), Copernicus Marine WAM wave forcing (`VHM0`, `VMDR`, 3-hourly, 9 km), and Google Earth Engine + CoastSat shorelines (Sentinel-2 + Landsat-8, sub-pixel, 372 cloud-free dates over 2018–2025) — cache them append-only, and reconcile them into a single per-(transect, date) wide table with a strict UTC-tz-aware 12-column schema. The spatial framework is a standard USGS DSAS One-Line Model setup, anchored to the OSM Atlantic coastline (not the inland Keta Lagoon): an onshore baseline (~150 m inland) following the NE-trending coast, ~1,173 perpendicular transects at 50 m along-shore spacing, each 750 m long, pointing seaward toward the open Atlantic. All spatial sources are interpolated to each transect's seaward sample point (in open water) — no spatial averaging — preserving along-shore variation while keeping queries off land-masked cells. The wave angle of incidence θ is computed from the wave direction and the local shore-normal, yielding the CERC longshore transport factor `W·sin(2θ)` as a derived column. Sparse temporal gaps are handled by dropping rows where forcing is missing within a 36-hour tolerance — no fabrication, no interpolation. The result is a ~150,000-row wide table covering 2018–2025 at Keta, ready to be transformed into model-ready arrays by the dataset loader and consumed by the PINN.

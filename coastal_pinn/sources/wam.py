@@ -2,10 +2,12 @@
 
 Uses the official copernicusmarine Python client with the WAM global
 wave model. Reanalysis is used where available; analysis/forecast for
-the most recent period. Resolution: 0.083 deg (~9 km), 3-hourly.
+the most recent period. Resolution: 0.2 deg reanalysis / 0.083 deg
+analysis, 3-hourly.
 
-The reanalysis product ID is `cmems_mod_glo_wav_my_0.083deg_PT3H-i`.
-The analysis/forecast product ID is `cmems_mod_glo_wav_anfc_0.083deg_PT3H-i`.
+The reanalysis product ID is `cmems_mod_glo_wav_my_0.2deg_PT3H-i` (0.2 deg).
+The analysis/forecast product ID is `cmems_mod_glo_wav_anfc_0.083deg_PT3H-i`
+(0.083 deg). Resolution differs between the two products.
 
 Variables:
     VHM0: spectral significant wave height (m)
@@ -173,14 +175,11 @@ def _to_dataframe(ds: xr.Dataset, cfg: PipelineConfig) -> pd.DataFrame:
             raise SourceUnavailable("wave_intensity",
                 f"missing variable {v!r} in cached dataset (vars={list(ds.data_vars)})")
 
+    # Sample waves at each transect's seaward end (open water), not at the
+    # inland baseline origin (see sea_level.py for rationale).
     transects_df = generate_transects(cfg.region)
-    transects_ll = transects_to_lonlat(transects_df, cfg.region.utm_zone)
-    if cfg.region.baseline is not None and len(cfg.region.baseline) >= 1:
-        baseline_lat = float(cfg.region.baseline[0][1])
-    else:
-        baseline_lat = float(transects_ll["origin_lat"].values[0])
-    raw_lons = transects_ll["origin_lon"].values
-    raw_lats = np.full(len(transects_df), baseline_lat)
+    from coastal_pinn.core.coords import transect_sample_points
+    raw_lons, raw_lats = transect_sample_points(transects_df, cfg.region.utm_zone)
     from coastal_pinn.core.coords import clamp_query_to_data_range
     clamped_lons, clamped_lats = clamp_query_to_data_range(raw_lons, raw_lats, ds)
     lon_pts = xr.DataArray(clamped_lons, dims="points")
