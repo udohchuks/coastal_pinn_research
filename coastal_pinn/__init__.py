@@ -8,7 +8,7 @@ Modules:
     exceptions  SourceUnavailable, ConfigError, MissingCredentials, SchemaError
     core        paths, coords, io, schema
     sources     one module per data source (bathymetry, sea_level, wave_intensity,
-                shoreline, sediment_recovery)
+                shoreline)
     pipeline    run_region, run, reconcile
     cli        argparse entry point
 """
@@ -36,7 +36,6 @@ from coastal_pinn.pipeline import (
 )
 from coastal_pinn.sources.bathymetry import fetch_bathymetry
 from coastal_pinn.sources.sea_level import fetch_sea_level
-from coastal_pinn.sources.sediment_recovery import compute_sediment_recovery
 from coastal_pinn.sources.shoreline import fetch_shorelines
 from coastal_pinn.sources.wave_intensity import fetch_wave_intensity
 
@@ -56,7 +55,6 @@ __all__ = [
     "fetch_sea_level",
     "fetch_wave_intensity",
     "fetch_shorelines",
-    "compute_sediment_recovery",
     "SourceUnavailable",
     "ConfigError",
     "MissingCredentials",

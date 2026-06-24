@@ -25,9 +25,8 @@ def _good_df() -> pd.DataFrame:
         "u_mag_m_s": [0.1, 0.12, 0.11],
         "W_m": [1.0, 1.1, 0.9],
         "W_dir_deg": [200.0, 210.0, 195.0],
-        "W_longshore": [-0.5, -0.4, -0.6],
+        "E_wave": [1.0 ** 2 / 16, 1.1 ** 2 / 16, 0.9 ** 2 / 16],
         "depth_m": [-10.0, -10.0, -10.0],
-        "R_sediment_m_yr": [0.0, 0.0, 0.0],
     })
 
 
@@ -48,11 +47,10 @@ def test_validate_rejects_missing_column():
         validate_schema(df)
 
 
-def test_validate_accepts_missing_R_when_allowed():
-    df = _good_df().drop(columns=["R_sediment_m_yr"])
-    # R_sediment_m_yr is in PINN_COLUMNS but not PINN_REQUIRED_COLUMNS;
-    # since it's optional in the wide table, this should still pass.
-    validate_schema(df)
+def test_validate_rejects_missing_E_wave():
+    df = _good_df().drop(columns=["E_wave"])
+    with pytest.raises(SchemaError, match="E_wave"):
+        validate_schema(df)
 
 
 def test_validate_rejects_non_numeric():
@@ -82,6 +80,8 @@ def test_ensure_utc_series():
     assert str(out.dt.tz) == "UTC"
 
 
-def test_pinn_required_columns_excludes_R():
-    assert "R_sediment_m_yr" in PINN_COLUMNS
-    assert "R_sediment_m_yr" not in PINN_REQUIRED_COLUMNS
+def test_all_columns_are_required():
+    # Every column (including the derived E_wave) is required: there is no
+    # NaN-placeholder column under the Yates+Vitousek cross-shore model.
+    assert PINN_REQUIRED_COLUMNS == PINN_COLUMNS
+    assert "E_wave" in PINN_COLUMNS

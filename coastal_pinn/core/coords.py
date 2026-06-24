@@ -205,35 +205,6 @@ def interp_field_to_transects(
         return np.asarray(sampled.values, dtype=float)
 
 
-def compute_wave_longshore(
-    W_m: np.ndarray,
-    W_dir_deg: np.ndarray,
-    shore_normal_deg: np.ndarray,
-) -> np.ndarray:
-    """Compute the CERC longshore wave component: W * sin(2*theta).
-
-    W_m: (T, N) or (N,) array of wave heights.
-    W_dir_deg: same shape, wave direction (meteorological, direction
-        waves come FROM, 0=N, 90=E, 180=S, 270=W).
-    shore_normal_deg: (N,) array, direction the transect points
-        (seaward, degrees CCW from East).
-
-    Returns the same shape as W_m: W * sin(2*theta) where theta is the
-    angle between the wave direction and the shore-normal.
-
-    Note: meteorological convention (waves coming FROM) means we convert
-    the wave direction to "direction the wave is GOING TO" by adding 180,
-    then measure the angle to the shore-normal.
-    """
-    W_dir_to = (W_dir_deg + 180.0) % 360.0
-    # Make sure shore_normal is broadcast to W shape
-    sn = np.asarray(shore_normal_deg, dtype=float)
-    while sn.ndim < W_dir_to.ndim:
-        sn = sn[np.newaxis, ...]
-    theta = np.deg2rad(W_dir_to - sn)
-    return W_m * np.sin(2.0 * theta)
-
-
 def depth_at_shore(bathy_df: pd.DataFrame, *, depth_column: str = "depth_m",
                    zone_column: str = "zone") -> float:
     """DEPRECATED in v2: scalar depth for backward compatibility.

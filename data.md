@@ -131,7 +131,7 @@ The sub-pixel accuracy matters: at 30 m uncertainty (MNDWI on Landsat), the −7
 | Auth required | Same Copernicus credentials as PHY (shared) |
 | Cache format | `.nc` (NetCDF) |
 
-**What it gives us:** The wave height `W` and wave direction `W_dir` at each transect, for each day. These feed the CERC longshore transport term `W·sin(2θ)` in the shoreline ODE.
+**What it gives us:** The wave height `W` and wave direction `W_dir` at each transect, for each day. The significant wave height `W` feeds the wave energy `E = W²/16` (Yates 2009), which drives the cross-shore shoreline ODE.
 
 **How we process it:**
 1. Download the (time, lat, lon) cube for the Keta bbox.
@@ -151,7 +151,7 @@ The sub-pixel accuracy matters: at 30 m uncertainty (MNDWI on Landsat), the −7
 | Auth | None | Copernicus login |
 | Forcing consistency | Different wind forcing than PHY | Same ECMWF wind forcing as PHY |
 
-WAM's higher resolution preserves along-shore wave gradients needed by the CERC longshore term. Shared ECMWF forcing with PHY ensures physical consistency between wave and ocean variables. The auth is shared with the PHY product — no additional credential setup.
+WAM's higher resolution preserves along-shore wave gradients, so the per-transect wave energy `E` reflects local conditions. Shared ECMWF forcing with PHY ensures physical consistency between wave and ocean variables. The auth is shared with the PHY product — no additional credential setup.
 
 **Code location:** `coastal_pinn/sources/wam.py` (with backward-compat re-export from `coastal_pinn/sources/wave_intensity.py`)
 
@@ -238,7 +238,7 @@ Each transect is a line segment in UTM coordinates:
 
 ### Why this convention
 
-The One-Line Model (Pelnard-Considère 1956) — which our shoreline evolution equation is based on — is parameterized this way in the published literature. USGS DSAS, the 2025 eastern-Ghana shoreline study, and most global shoreline-change papers use this exact setup: inland baseline, perpendicular transects at fixed along-shore spacing, cross-shore distance measured from the baseline.
+This transect convention is the standard in the published literature. USGS DSAS, the 2025 eastern-Ghana shoreline study, and most global shoreline-change papers — including the cross-shore equilibrium models our evolution equation is based on (Yates et al. 2009; Vitousek et al. 2017) — use this exact setup: inland baseline, perpendicular transects at fixed along-shore spacing, cross-shore distance measured from the baseline.
 
 The along-shore coordinate `x` (which transect you're on) is the spatial axis of the model. The cross-shore distance `S(x_n, t)` is the target variable — the shoreline position at that transect at that time.
 
@@ -337,21 +337,18 @@ The reconcile step (`coastal_pinn/pipeline.py::reconcile()`) is the single contr
 
 3. **Compute current speed magnitude.** `u_mag_m_s = sqrt(u_east_m_s² + u_north_m_s²)`.
 
-4. **Compute W_longshore (the CERC longshore factor).**
-   - For each merged row, look up the transect's `shore_normal_deg` from the transects table.
-   - Compute the wave angle of incidence: `θ = (W_dir_deg + 180°) − shore_normal_deg`. The `+180°` converts meteorological convention (direction waves come FROM) to oceanographic convention (direction waves are GOING TO).
-   - Compute: `W_longshore = W_m × sin(2θ)`.
-   - This is the CERC (USACE 1984) longshore transport factor. `sin(2θ)` is zero when waves hit perpendicular (θ=0° or 180°) and maximum at θ=45°.
+4. **Compute E_wave (the Yates wave energy).**
+   - For each merged row, compute `E_wave = W_m² / 16`.
+   - This is the Yates et al. (2009) wave energy: `E` is proportional to the significant wave height squared, scaled so that a wave energy of ~0.05 m² corresponds to `H_s = 0.9 m` (since `0.9²/16 ≈ 0.05`).
+   - `E_wave` is the only model-specific quantity in the wide table. The coefficients `C±`, `E_eq`, and the long-term trend `v` are learned by the PINN (see §7).
 
 5. **Attach per-transect depth.** Map `depth_m` from the bathymetry DataFrame to each row by `transect_id`.
 
-6. **Leave R_sediment_m_yr as NaN.** Sediment recovery is not fetched — it is a model concern (the PINN learns it as a neural closure). The column is reserved so the schema doesn't change when the closure is implemented.
+6. **Drop rows with any NaN in required columns.** No fabrication, no interpolation. If a shoreline observation has no matching forcing within 36 hours, the row is dropped with a warning.
 
-7. **Drop rows with any NaN in required columns.** No fabrication, no interpolation. If a shoreline observation has no matching forcing within 36 hours, the row is dropped with a warning.
+7. **Validate schema.** Check that all required columns are present, timestamps are UTC, numeric columns are numeric, and `transect_id` is integer.
 
-8. **Validate schema.** Check that all required columns are present, timestamps are UTC, numeric columns are numeric, and `transect_id` is integer.
-
-9. **Write to disk.** Atomic write of CSV and pickle to `cfg.output_dir`.
+8. **Write to disk.** Atomic write of CSV and pickle to `cfg.output_dir`.
 
 ### The as-of join explained
 
@@ -385,14 +382,12 @@ The output of the pipeline is a single pandas DataFrame (written to CSV and pick
 | 7 | `u_mag_m_s` | float | Current speed magnitude at this transect and time (m/s) |
 | 8 | `W_m` | float | Significant wave height at this transect and time (m) |
 | 9 | `W_dir_deg` | float | Mean wave direction (meteorological, 0–360°) |
-| 10 | `W_longshore` | float | **Derived:** `W_m × sin(2θ)` — CERC longshore transport factor |
+| 10 | `E_wave` | float | **Derived:** `W_m² / 16` — Yates et al. (2009) wave energy |
 | 11 | `depth_m` | float | GEBCO depth at this transect (m; static, same for all dates) |
-| 12 | `R_sediment_m_yr` | float | **Placeholder:** NaN at fetch time; learned by the PINN closure |
 
-### Required vs. optional columns
+### Required columns
 
-- **Required (must be non-NaN):** columns 1–11. Any row with NaN in these is dropped.
-- **Optional (allowed to be NaN):** column 12 (`R_sediment_m_yr`). This is the sediment recovery placeholder — the network learns it; the data does not provide it.
+All 11 columns are **required (must be non-NaN)** — any row with NaN in these is dropped. `E_wave` is a closed-form function of `W_m`, so it is never independently missing. There is no NaN-placeholder column: the model's learned quantities (`C±`, `E_eq`, `v`) are parameters, not data columns.
 
 ### Schema validation
 
@@ -424,50 +419,52 @@ $$\frac{\partial h}{\partial t} + u \frac{\partial h}{\partial x} = 0$$
 
 **Role in the model:** This is a **physics constraint** in the PINN loss. The network's predicted `ĥ` and `û` should obey this equation at every collocation point. The spatial gradient `∂h/∂x` is computed by autograd through the network, but it is only meaningful if the data has along-shore variation in `h` — which is why we interpolate to per-transect values instead of spatially averaging.
 
-### Equation 2: The shoreline evolution ODE (data-fitted)
+### Equation 2: The cross-shore equilibrium shoreline ODE (data-fitted)
 
-$$\frac{\partial S}{\partial t} = \alpha W \sin(2\theta) - \beta R - \gamma \frac{\partial^2 S}{\partial x^2}$$
+This is the Yates et al. (2009) wave-energy disequilibrium model with the
+Vitousek et al. (2017, CoSMoS-COAST) long-term trend term `v`:
+
+$$\frac{dS}{dt} = C^{\pm}\sqrt{E}\,(E - E_{eq}) + v$$
 
 | Symbol | Physical meaning | Data column | Source |
 |---|---|---|---|
 | `S` | Shoreline position (m) | `cross_shore_S_m` | CoastSat (transect intersection) |
-| `W` | Wave height (m) | `W_m` | Copernicus WAM (`VHM0`) |
-| `θ` | Wave angle relative to shore-normal | Computed from `W_dir_deg` and `shore_normal_deg` | Copernicus WAM (`VMDR`) + transect geometry |
-| `W·sin(2θ)` | CERC longshore transport factor | `W_longshore` | Derived in reconcile step |
-| `R` | Sediment recovery (m/yr) | `R_sediment_m_yr` (NaN) | **Learned by PINN closure** |
-| `α` | Erosion coefficient | — | Learnable parameter (sigmoid-bounded [0, 1]) |
-| `β` | Recovery coefficient | — | Learnable parameter (sigmoid-bounded [0, 0.5]) |
-| `γ` | Alongshore diffusion coefficient | — | Learnable parameter (bounded [10², 10⁴]) |
-| `x` | Along-shore position (m) | `along_shore_x_m` | Transect geometry |
+| `E` | Wave energy (∝ `H_s²`), `E = W_m²/16` | `E_wave` | Derived from `W_m` (Copernicus WAM `VHM0`) |
+| `ΔE = E − E_eq` | Wave-energy disequilibrium (positive → erosion, negative → accretion) | Computed from `E_wave` and learned `E_eq` | — |
+| `√E` | Rate limiter (prevents nonphysical change when `E` is small) | Derived from `E_wave` | — |
+| `C±` | Change-rate coefficient (`C⁺` accretion when `ΔE<0`, `C⁻` erosion when `ΔE>0`) | — | Learnable parameter (Yates 2009) |
+| `E_eq` | Equilibrium wave energy | — | Learnable parameter (Yates 2009) |
+| `v` | Long-term linear trend (aggregates slow non-wave drift) | — | Learnable parameter (Vitousek 2017) |
 | `t` | Time (days) | `timestamp` | Observation timestamp |
 
-**Role in the model:** This is the **data-fitted** equation. The observed `S(t)` supervises the model. The `∂²S/∂x²` diffusion term is a finite difference across adjacent transects — this is the standard One-Line Model (Pelnard-Considère 1956) alongshore sediment transport smoothing.
+**Role in the model:** This is the **data-fitted** equation, applied per
+transect (cross-shore only — no alongshore diffusion). The observed `S(t)`
+supervises the model. The Yates term `C±√E·ΔE` captures the back-and-forth
+(waves erode, calm periods rebuild) around an equilibrium; on its own it has
+no long-term drift. The Vitousek trend `v` adds that drift, aggregating
+long-term influences not captured by the wave term — fluvial or offshore
+sediment exchange. **At Keta, `v` absorbs the slow, non-wave erosion driven
+by the Volta/Akosombo dam sediment cutoff.** The wave term is cited to Yates
+et al. (2009); the trend term `v` is cited to Vitousek et al. (2017).
 
-### The neural closure for R
+### The learned parameters
 
-$$R_\theta(h, u, W, \text{depth}, t) \geq 0$$
-
-| Closure input | Data column | Source |
-|---|---|---|
-| `h` | `h_m` | Copernicus PHY |
-| `u` | `u_mag_m_s` | Copernicus PHY |
-| `W` | `W_m` | Copernicus WAM |
-| `depth` | `depth_m` | GEBCO |
-| `t` | `timestamp` | Observation timestamp |
-
-**Role in the model:** Sediment recovery `R` is a real physical process (longshore transport, riverine input, beach-face recovery between storms) but is not directly observable in our data. Rather than fabricate it from a proxy, the PINN learns a function from forcing variables to recovery rate. The non-negativity constraint (`R ≥ 0`) is enforced by a `softplus` activation in the closure sub-network.
+`C±`, `E_eq`, and `v` are **not** data columns — the PINN learns them. The
+data side supplies only `E_wave` (and the target `cross_shore_S_m`). The
+remaining forcing columns (`h_m`, `u_mag_m_s`, `W_m`, `W_dir_deg`,
+`depth_m`) remain available as features/inputs to the network, e.g. to let
+the learned coefficients vary with local conditions.
 
 ### The PINN loss function
 
-$$\mathcal{L} = \lambda_{\text{PDE}} r_{\text{PDE}}^2 + \lambda_{\text{data}} r_{\text{data}}^2 + \lambda_{\text{BC}} r_{\text{BC}}^2 + \lambda_{\text{ODE}} r_{\text{ODE}}^2 + \lambda_{\text{nonneg}} \max(0, -R)^2$$
+$$\mathcal{L} = \lambda_{\text{PDE}} r_{\text{PDE}}^2 + \lambda_{\text{data}} r_{\text{data}}^2 + \lambda_{\text{BC}} r_{\text{BC}}^2 + \lambda_{\text{ODE}} r_{\text{ODE}}^2$$
 
 | Loss term | What it penalizes | Data it uses |
 |---|---|---|
 | `r_PDE` | Violation of `∂h/∂t + u·∂h/∂x = 0` | `h_m`, `u_mag_m_s`, `along_shore_x_m`, `timestamp` |
 | `r_data` | `Ŝ(x_n, t_i) − S_obs(x_n, t_i)` | `cross_shore_S_m`, `along_shore_x_m`, `timestamp` |
 | `r_BC` | Boundary condition (zero-gradient at spatial ends) | `along_shore_x_m` at transect 0 and ~1172 |
-| `r_ODE` | Violation of `∂S/∂t − αW·sin(2θ) + βR + γ·∂²S/∂x² = 0` | `cross_shore_S_m`, `W_longshore`, `R_sediment_m_yr` (learned), `along_shore_x_m`, `timestamp` |
-| `max(0, −R)` | Negative sediment recovery (physically forbidden) | `R_sediment_m_yr` (learned) |
+| `r_ODE` | Violation of `dS/dt − C±√E·(E − E_eq) − v = 0` | `cross_shore_S_m`, `E_wave`, `timestamp` |
 
 ---
 
@@ -478,7 +475,6 @@ $$\mathcal{L} = \lambda_{\text{PDE}} r_{\text{PDE}}^2 + \lambda_{\text{data}} r_
 | Kind | Physical meaning | How we handle it |
 |---|---|---|
 | **Time-of-observation** | A shoreline date has no matching forcing within 36 h | **Drop the row.** No fabrication. |
-| **Structural** (`R_sediment_m_yr`) | Sediment recovery is not observed | **Leave as NaN.** The PINN learns R as a closure. |
 | **Source failure** | A whole source is unavailable (auth expired, ERDDAP timeout) | **Fail loud** at the fetch step with a clear error message. |
 | **Out-of-bounds** | Transect lon/lat is just outside the data grid (floating-point drift) | **Clamp** query lon/lat to the data's coordinate range. |
 
@@ -492,9 +488,8 @@ The pipeline never:
 - Interpolates forcing across gaps.
 - Fabricates shoreline positions for cloud-blocked dates.
 - Fills missing values with climatological means.
-- Imputes sediment recovery from a proxy.
 
-Every value in the wide table is either directly observed, directly interpolated from a gridded product to a transect location, or derived from observed values (like `u_mag` or `W_longshore`). The only exception is `R_sediment_m_yr`, which is intentionally NaN — the model's job is to learn it.
+Every value in the wide table is either directly observed, directly interpolated from a gridded product to a transect location, or derived from observed values (like `u_mag` or `E_wave`). The model's parameters (`C±`, `E_eq`, `v`) are learned, not stored as columns, so there is no NaN-placeholder column to explain away.
 
 ---
 
@@ -519,7 +514,7 @@ After the as-of join with 36 h tolerance and dropping NaN rows:
 | Cloud-free dates | ~372 |
 | Maximum possible rows | ~1,173 × 372 ≈ 436,000 |
 | Expected valid rows (after drops) | scales with the intersection rate (see the low-intersection guard) |
-| Columns | 12 |
+| Columns | 11 |
 | Typical CSV size | ~20–30 MB |
 
 ### The train/val/test split
@@ -589,8 +584,7 @@ coastal_pinn/sources/
 ├── sea_level.py          Copernicus PHY → per-transect h, u_east, u_north
 ├── wam.py                Copernicus WAM → per-transect W, W_dir
 ├── wave_intensity.py     Re-export from wam.py (backward compat)
-├── bathymetry.py         GEBCO → per-transect depth
-└── sediment_recovery.py  NotImplementedError placeholder (R is learned)
+└── bathymetry.py         GEBCO → per-transect depth
 ```
 
 ### Core modules
@@ -599,7 +593,7 @@ coastal_pinn/sources/
 coastal_pinn/core/
 ├── schema.py             PINN_COLUMNS, validate_schema(), ensure_utc()
 ├── coords.py             UTM conversions, transect utilities, field interpolation,
-│                         clamp_query_to_data_range(), compute_wave_longshore()
+│                         clamp_query_to_data_range()
 ├── io.py                 Atomic CSV/pickle writes
 └── paths.py              Append-only cache directory structure
 ```
@@ -647,4 +641,4 @@ tests/
 
 ## Summary — One Paragraph
 
-We ingest four open-access data sources — GEBCO bathymetry (NOAA ERDDAP, no auth), Copernicus Marine PHY sea level and currents (`zos`, `uo`, `vo`, daily, 9 km), Copernicus Marine WAM wave forcing (`VHM0`, `VMDR`, 3-hourly, 9 km), and Google Earth Engine + CoastSat shorelines (Sentinel-2 + Landsat-8, sub-pixel, 372 cloud-free dates over 2018–2025) — cache them append-only, and reconcile them into a single per-(transect, date) wide table with a strict UTC-tz-aware 12-column schema. The spatial framework is a standard USGS DSAS One-Line Model setup, anchored to the OSM Atlantic coastline (not the inland Keta Lagoon): an onshore baseline (~150 m inland) following the NE-trending coast, ~1,173 perpendicular transects at 50 m along-shore spacing, each 750 m long, pointing seaward toward the open Atlantic. All spatial sources are interpolated to each transect's seaward sample point (in open water) — no spatial averaging — preserving along-shore variation while keeping queries off land-masked cells. The wave angle of incidence θ is computed from the wave direction and the local shore-normal, yielding the CERC longshore transport factor `W·sin(2θ)` as a derived column. Sparse temporal gaps are handled by dropping rows where forcing is missing within a 36-hour tolerance — no fabrication, no interpolation. The result is a ~150,000-row wide table covering 2018–2025 at Keta, ready to be transformed into model-ready arrays by the dataset loader and consumed by the PINN.
+We ingest four open-access data sources — GEBCO bathymetry (NOAA ERDDAP, no auth), Copernicus Marine PHY sea level and currents (`zos`, `uo`, `vo`, daily, 9 km), Copernicus Marine WAM wave forcing (`VHM0`, `VMDR`, 3-hourly, 9 km), and Google Earth Engine + CoastSat shorelines (Sentinel-2 + Landsat-8, sub-pixel, 372 cloud-free dates over 2018–2025) — cache them append-only, and reconcile them into a single per-(transect, date) wide table with a strict UTC-tz-aware 11-column schema. The spatial framework is a standard USGS DSAS One-Line Model setup, anchored to the OSM Atlantic coastline (not the inland Keta Lagoon): an onshore baseline (~150 m inland) following the NE-trending coast, ~1,173 perpendicular transects at 50 m along-shore spacing, each 750 m long, pointing seaward toward the open Atlantic. All spatial sources are interpolated to each transect's seaward sample point (in open water) — no spatial averaging — preserving along-shore variation while keeping queries off land-masked cells. The significant wave height yields the Yates et al. (2009) wave energy `E = W²/16` (`E_wave`) as a derived column, which drives the cross-shore equilibrium shoreline ODE (Yates 2009 wave term + Vitousek 2017 long-term trend `v`). Sparse temporal gaps are handled by dropping rows where forcing is missing within a 36-hour tolerance — no fabrication, no interpolation. The result is a ~150,000-row wide table covering 2018–2025 at Keta, ready to be transformed into model-ready arrays by the dataset loader and consumed by the PINN.

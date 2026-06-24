@@ -5,10 +5,11 @@ oceanographic, and bathymetric datasets and reconciles them into a single
 per-transect wide-format table for downstream PINN (Physics-Informed Neural
 Network) training.
 
-Built for the Ghana coastline (Keta region) per a standard One-Line Model
-framework with USGS DSAS conventions (inland baseline, perpendicular transects
-at 100 m along-shore spacing). Supports the full Gulf of Guinea by adding
-new regions to `coastal_pinn/config.py::REGIONS`.
+Built for the Ghana coastline (Keta region) using a cross-shore equilibrium
+shoreline model (Yates 2009 + Vitousek 2017) with USGS DSAS conventions
+(inland baseline, perpendicular transects at 100 m along-shore spacing).
+Supports the full Gulf of Guinea by adding new regions to
+`coastal_pinn/config.py::REGIONS`.
 
 ## Data sources
 
@@ -21,13 +22,21 @@ new regions to `coastal_pinn/config.py::REGIONS`.
 
 All spatial sources (Copernicus PHY, WAM, GEBCO) are interpolated to the
 exact (lon, lat) of each transect origin — no spatial averaging. This
-preserves along-shore gradients needed by the PDE term and the CERC
-longshore transport factor.
+preserves along-shore gradients needed by the shallow-water PDE term.
 
-Sediment recovery `R` (paper Eq.: `dS/dt = αW·sin(2θ) − βR − γ·∂²S/∂x²`)
-is intentionally **not** fetched — it is a model concern (PINN learns `β`
-and the closure `R_θ`). The wide table reserves an `R_sediment_m_yr`
-column for future implementation.
+The shoreline model is the Yates et al. (2009) cross-shore equilibrium ODE
+with the Vitousek et al. (2017, CoSMoS-COAST) long-term trend term:
+
+```
+dS/dt = C± · √E · (E − E_eq) + v        E = H_s² / 16
+```
+
+`E` is the wave energy, derived from the significant wave height `H_s`
+(`W_m`) as `E = W_m²/16` and stored in the `E_wave` column. The
+coefficients `C±` (accretion/erosion rate), `E_eq` (equilibrium wave
+energy), and `v` (long-term linear trend — at Keta this absorbs the slow,
+non-wave drift from the Volta/Akosombo sediment cutoff) are **not** fetched:
+they are all learned by the PINN. The data provides only `E_wave`.
 
 ## Wide table schema
 
@@ -43,9 +52,8 @@ h_m               (float)            sea level at this transect (m)
 u_mag_m_s         (float)            current speed magnitude at this transect (m/s)
 W_m               (float)            significant wave height at this transect (m)
 W_dir_deg         (float)            mean wave direction (deg, 0-360)
-W_longshore       (float)            DERIVED: W_m * sin(2*theta), CERC longshore factor
+E_wave            (float)            DERIVED: wave energy E = W_m**2/16 (Yates 2009)
 depth_m           (float)            GEBCO depth at this transect (m)
-R_sediment_m_yr   (float)            placeholder, NaN until implemented
 ```
 
 All timestamps are **UTC-localized (tz-aware)**. This is enforced at every
@@ -199,8 +207,7 @@ coastal_pinn/
 │   │   ├── sea_level.py     Copernicus Marine PHY (zos, uo, vo) per-transect
 │   │   ├── wam.py           Copernicus Marine WAM (VHM0, VMDR) per-transect
 │   │   ├── wave_intensity.py  re-export from wam.py (backward compat)
-│   │   ├── shoreline.py     GEE + CoastSat (N-transect intersection)
-│   │   └── sediment_recovery.py  NotImplementedError placeholder
+│   │   └── shoreline.py     GEE + CoastSat (N-transect intersection)
 │   ├── pipeline.py          run_region, run, reconcile
 │   └── cli.py               argparse + YAML loader
 ├── scripts/

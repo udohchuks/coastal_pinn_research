@@ -23,13 +23,21 @@ Columns:
                         and time (interpolated from Copernicus WAM)
     W_dir_deg           float, wave direction (meteorological, 0-360)
                         at this transect and time
-    W_longshore         float, DERIVED: W_m * sin(2*theta) where theta
-                        is the angle of wave incidence relative to the
-                        local shore-normal. CERC longshore transport
-                        factor.
+    E_wave              float, DERIVED: wave energy E = W_m**2 / 16, the
+                        Yates et al. (2009) wave-energy term (E proportional
+                        to significant wave height squared). Drives the
+                        cross-shore equilibrium shoreline ODE.
     depth_m             float, GEBCO depth at this transect (static)
-    R_sediment_m_yr     float, LEARNED by network closure. NaN at fetch
-                        time; the model infers it.
+
+The shoreline model is the Yates et al. (2009) cross-shore equilibrium ODE
+with the Vitousek et al. (2017) CoSMoS-COAST long-term trend term:
+
+    dS/dt = C_pm * sqrt(E) * (E - E_eq) + v
+
+E_wave is the only model-specific quantity provided by the data; the
+coefficients C_pm (accretion/erosion rate), E_eq (equilibrium wave energy),
+and v (long-term linear trend, e.g. the Volta/Akosombo sediment cutoff at
+Keta) are all LEARNED by the PINN and are not data columns.
 """
 
 from __future__ import annotations
@@ -51,13 +59,13 @@ PINN_COLUMNS: list[str] = [
     "u_mag_m_s",
     "W_m",
     "W_dir_deg",
-    "W_longshore",
+    "E_wave",
     "depth_m",
-    "R_sediment_m_yr",
 ]
 
-# R_sediment_m_yr is allowed to be NaN; the others are required.
-PINN_REQUIRED_COLUMNS: list[str] = [c for c in PINN_COLUMNS if c != "R_sediment_m_yr"]
+# Every column is derived from an observed/interpolated value (E_wave is a
+# closed-form function of W_m), so all columns are required.
+PINN_REQUIRED_COLUMNS: list[str] = list(PINN_COLUMNS)
 
 
 _DTYPE_CHECKS: dict[str, set[str]] = {
@@ -70,9 +78,8 @@ _DTYPE_CHECKS: dict[str, set[str]] = {
     "u_mag_m_s": {"float64", "float32"},
     "W_m": {"float64", "float32"},
     "W_dir_deg": {"float64", "float32"},
-    "W_longshore": {"float64", "float32"},
+    "E_wave": {"float64", "float32"},
     "depth_m": {"float64", "float32"},
-    "R_sediment_m_yr": {"float64", "float32"},
 }
 
 

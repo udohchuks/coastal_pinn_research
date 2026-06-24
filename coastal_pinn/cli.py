@@ -60,8 +60,7 @@ def build_parser() -> argparse.ArgumentParser:
     # --- fetch ---
     p_fetch = sub.add_parser("fetch", help="fetch a single source")
     p_fetch.add_argument("source", choices=["bathymetry", "sea_level",
-                                            "wave_intensity", "shoreline",
-                                            "sediment_recovery"])
+                                            "wave_intensity", "shoreline"])
     p_fetch.add_argument("--config", required=True, help="path to YAML config")
     p_fetch.add_argument("--time-start")
     p_fetch.add_argument("--time-end")
@@ -129,16 +128,6 @@ def cmd_fetch(args: argparse.Namespace) -> int:
     elif name == "shoreline":
         from coastal_pinn.sources.shoreline import fetch_shorelines
         df = fetch_shorelines(cfg)
-    elif name == "sediment_recovery":
-        from coastal_pinn.sources.sediment_recovery import compute_sediment_recovery
-        import pandas as pd
-        dates = pd.date_range(cfg.t_start, cfg.t_end, freq="D", tz="UTC")
-        s = compute_sediment_recovery(cfg, dates)
-        df = s.reset_index()
-        df.columns = ["timestamp", "R_sediment_m_yr"]
-        df["region"] = cfg.region.name
-        print(df.head())
-        return 0
     else:
         print(f"unknown source: {name}", file=sys.stderr)
         return 2

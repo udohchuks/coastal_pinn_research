@@ -24,6 +24,7 @@ Thumbs.db
 
 # Package cache (data we produce). Commit only config/, not data/.
 coastal_research_ashesi/
+coastal_research_ashesi_smoke/
 data/
 
 # Credentials / secrets

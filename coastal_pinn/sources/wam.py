@@ -16,7 +16,8 @@ Variables:
 v2 (per-transect): like sea_level.py, the (time, lat, lon) cube is
 interpolated to the (lon, lat) of each transect generated from
 cfg.region.baseline. This preserves along-shore variation in W and
-W_dir, which the CERC longshore term W * sin(2*theta) needs.
+W_dir. The significant wave height W feeds the Yates et al. (2009)
+wave energy E = W**2 / 16 (derived downstream in reconcile()).
 
 Returns a DataFrame with columns:
     region       str

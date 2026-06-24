@@ -67,9 +67,10 @@ def test_reconcile_full_pipeline(keta_config, real_shape_bathy_nc,
     assert "transect_id" in wide.columns
     assert "along_shore_x_m" in wide.columns
     assert "cross_shore_S_m" in wide.columns
-    # no NaN in required columns
+    # no NaN in required columns (all columns are required)
     assert wide[PINN_REQUIRED_COLUMNS].notna().all().all()
-    # R_sediment_m_yr is allowed to be NaN (placeholder)
+    # E_wave is the derived Yates wave energy, E = W_m**2 / 16
+    assert np.allclose(wide["E_wave"], wide["W_m"] ** 2 / 16.0)
     # The csv + pkl files were written
     out_dir = keta_config.output_dir
     csvs = list(out_dir.glob("*.csv"))

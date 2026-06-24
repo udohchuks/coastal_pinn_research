@@ -27,7 +27,6 @@ import numpy as np
 import pandas as pd
 
 from coastal_pinn.config import PipelineConfig, Region
-from coastal_pinn.core.coords import compute_wave_longshore
 from coastal_pinn.core.io import write_csv_atomic, write_pickle_atomic
 from coastal_pinn.core.paths import pinn_wide_path
 from coastal_pinn.core.schema import (
@@ -40,7 +39,6 @@ from coastal_pinn.sources.bathymetry import fetch_bathymetry
 from coastal_pinn.sources.sea_level import fetch_sea_level
 from coastal_pinn.sources.wave_intensity import fetch_wave_intensity
 from coastal_pinn.sources.shoreline import fetch_shorelines
-from coastal_pinn.sources.transects import generate_transects
 
 
 # ---------------------------------------------------------------------------
@@ -181,11 +179,10 @@ def reconcile(cfg: PipelineConfig,
       2. For each (transect_id, shoreline_timestamp), find nearest sea level
          and waves within cfg.join_tolerance (per-transect asof join).
       3. Compute u_mag from u_east and u_north.
-      4. Compute W_longshore = W_m * sin(2*theta) using shore-normal direction.
+      4. Compute E_wave = W_m**2 / 16 (Yates 2009 wave energy).
       5. Attach per-transect depth_m from bathymetry.
-      6. Leave R_sediment_m_yr as NaN (sediment_recovery not implemented).
-      7. Drop rows with any NaN in PINN_REQUIRED_COLUMNS.
-      8. Validate schema, write CSV + pkl to cfg.output_dir.
+      6. Drop rows with any NaN in PINN_REQUIRED_COLUMNS.
+      7. Validate schema, write CSV + pkl to cfg.output_dir.
     """
     from coastal_pinn.core.schema import ensure_utc
     if shoreline_df.empty:
@@ -253,28 +250,13 @@ def reconcile(cfg: PipelineConfig,
             f"bathymetry table missing depth_m; got {list(bathy_df.columns)}"
         )
 
-    # W_longshore: derive from W_m, W_dir_deg, and per-transect shore_normal_deg.
-    # We need the transects table to get shore_normal_deg.
-    transects_df = generate_transects(cfg.region)
-    sn_by_transect = transects_df.set_index("transect_id")["shore_normal_deg"]
-    sn_per_row = merged["transect_id"].map(sn_by_transect).values
-    W_dir = merged["W_dir_deg"].values
-    W_m = merged["W_m"].values
-    # compute_wave_longshore expects (T, N) or (N,) arrays. Here we have
-    # shape (M,) where M is the number of merged rows. shore_normal is
-    # per-row but constant within a transect.
-    merged["W_longshore"] = compute_wave_longshore(
-        W_m=W_m,
-        W_dir_deg=W_dir,
-        shore_normal_deg=sn_per_row,
-    )
-
-    # R_sediment_m_yr is left NaN by design: per data.md §7-8, sediment
-    # recovery is NOT fabricated from a proxy — the PINN learns it as a
-    # non-negative neural closure R_theta(h, u, W, depth, t). A physics
-    # proxy estimator exists in sources/sediment_recovery.py for comparison,
-    # but it is intentionally NOT wired into the canonical training table.
-    merged["R_sediment_m_yr"] = np.nan
+    # E_wave: the Yates et al. (2009) wave energy, E proportional to the
+    # significant wave height squared. Yates scales it as E = H_s**2 / 16
+    # (a wave energy of ~0.05 m^2 corresponds to H_s = 0.9 m). This is the
+    # only model-specific quantity the data provides; the coefficients
+    # C_pm, E_eq, and the Vitousek (2017) trend term v are all learned by
+    # the PINN. See data.md §7.
+    merged["E_wave"] = merged["W_m"].astype(float) ** 2 / 16.0
 
     # Drop rows with missing required inputs
     n_total = len(merged)
