@@ -110,6 +110,18 @@ class PipelineConfig:
     # extracted shoreline data, but they dominate the per-image processing
     # time. Set True when you need to eyeball the detections.
     shoreline_save_qc: bool = False
+    # Server-side cloud pre-filter: drop scenes whose scene-level cloud cover
+    # (S2 CLOUDY_PIXEL_PERCENTAGE) exceeds this percentage BEFORE download.
+    # CoastSat's built-in default is a very loose 95 (only near-total cloud).
+    # Lower = fewer downloads/faster, but the percentage is over the whole S2
+    # tile, so too aggressive a value can drop scenes that are cloudy tile-wide
+    # yet clear over this small AOI. 80-90 is a safe range for cloudy coasts
+    # like the Gulf of Guinea.
+    shoreline_cloud_cover_max: int = 85
+    # Number of tiles downloaded + extracted in parallel. Each in-flight tile
+    # uses a few GB of disk (deleted right after extraction). GEE throttles
+    # beyond ~10 concurrent requests, so 6-10 is the practical sweet spot.
+    shoreline_download_workers: int = 8
 
     # reconciliation
     join_tolerance: str = "36h"   # pandas Timedelta-compatible string
@@ -260,6 +272,8 @@ def _raw_to_config(raw: dict[str, Any], source: str = "<dict>") -> PipelineConfi
 
     shoreline_src = sources.get("shoreline") or {}
     shoreline_save_qc = bool(shoreline_src.get("save_qc", False))
+    shoreline_cloud_cover_max = int(shoreline_src.get("cloud_cover_max", 85))
+    shoreline_download_workers = int(shoreline_src.get("download_workers", 8))
 
     return PipelineConfig(
         region=region,
@@ -276,6 +290,8 @@ def _raw_to_config(raw: dict[str, Any], source: str = "<dict>") -> PipelineConfi
         shoreline_gee_project=_src_str("shoreline", "gee_project", "igem2026"),
         shoreline_sitename=_src_str("shoreline", "sitename", "Keta"),
         shoreline_save_qc=shoreline_save_qc,
+        shoreline_cloud_cover_max=shoreline_cloud_cover_max,
+        shoreline_download_workers=shoreline_download_workers,
         join_tolerance=join_tolerance,
     )
 
@@ -301,7 +317,7 @@ def init_config_yaml(region: Region, out_path: str | Path) -> None:
             "bathymetry": {"enabled": True, "product": "gebco_2026"},
             "sea_level": {"enabled": True, "product": "copernicus_phy_anfc"},
             "wave_intensity": {"enabled": True, "product": "copernicus_wam"},
-            "shoreline": {"enabled": True, "gee_project": "igem2026", "sitename": region.name.title(), "save_qc": False},
+            "shoreline": {"enabled": True, "gee_project": "igem2026", "sitename": region.name.title(), "save_qc": False, "cloud_cover_max": 85, "download_workers": 8},
         },
     }
     if region.baseline is not None:

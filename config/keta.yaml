@@ -102,3 +102,8 @@ sources:
     gee_project: igem2026
     sitename: Keta
     save_qc: false
+    # Drop S2 scenes cloudier than this (scene-level %) BEFORE download.
+    # Lower = faster (fewer downloads) but may skip scenes clear over Keta.
+    cloud_cover_max: 85
+    # Tiles downloaded + extracted in parallel (each cleaned up after).
+    download_workers: 1

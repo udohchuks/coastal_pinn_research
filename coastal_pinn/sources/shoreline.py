@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import os
 import pickle
+import shutil
 import sys
 from pathlib import Path
 from typing import Any
@@ -93,6 +94,109 @@ def _patch_skimage_io():
         skimage.io = mod  # type: ignore[attr-defined]
     except ImportError:
         pass
+
+def _patch_os_rename():
+    """Inject a retry loop into os.rename to bypass Windows file locks (WinError 32).
+    
+    CoastSat's SDS_download script downloads TIFFs and immediately renames them. On Windows, 
+    background processes like Defender or OneDrive often lock new files briefly, causing 
+    os.rename to crash. This adds a retry loop to handle those ephemeral locks.
+    """
+    import os
+    import time
+    _orig_rename = os.rename
+    def _patched_rename(src, dst):
+        for attempt in range(15):
+            try:
+                return _orig_rename(src, dst)
+            except OSError as e:
+                # WinError 32: The process cannot access the file because it is being used by another process.
+                if getattr(e, "winerror", None) == 32:
+                    time.sleep(1)
+                else:
+                    raise
+        return _orig_rename(src, dst)
+    os.rename = _patched_rename
+
+
+def _patch_process_shoreline():
+    """Inject cKDTree into SDS_shoreline.process_shoreline to vectorize cloud filtering."""
+    import sys
+    import numpy as np
+    from scipy.spatial import cKDTree
+
+    if "coastsat.SDS_shoreline" not in sys.modules:
+        return
+    SDS_shoreline = sys.modules["coastsat.SDS_shoreline"]
+    
+    if getattr(SDS_shoreline, "_patched_process_shoreline", False):
+        return
+        
+    def _fast_process_shoreline(contours, cloud_mask, im_nodata, georef, image_epsg, settings):
+        from coastsat import SDS_tools
+        from shapely.geometry import LineString
+        
+        contours_world = SDS_tools.convert_pix2world(contours, georef)
+        contours_epsg = SDS_tools.convert_epsg(contours_world, image_epsg, settings['output_epsg'])
+        
+        contours_long = []
+        for wl in contours_epsg:
+            coords = [(wl[k,0], wl[k,1]) for k in range(len(wl))]
+            a = LineString(coords)
+            if a.length >= settings['min_length_sl']:
+                contours_long.append(wl)
+                
+        if len(contours_long) == 0:
+            return np.zeros((0, 2))
+            
+        x_points = np.concatenate([c[:,0] for c in contours_long])
+        y_points = np.concatenate([c[:,1] for c in contours_long])
+        shoreline = np.column_stack((x_points, y_points))
+        
+        if np.sum(cloud_mask) > 0:
+            idx_cloud = np.where(cloud_mask)
+            idx_cloud = np.column_stack((idx_cloud[0], idx_cloud[1]))
+            coords_cloud = SDS_tools.convert_epsg(SDS_tools.convert_pix2world(idx_cloud, georef),
+                                                   image_epsg, settings['output_epsg'])
+            tree = cKDTree(coords_cloud)
+            dists, _ = tree.query(shoreline, k=1, distance_upper_bound=settings['dist_clouds'])
+            idx_keep = dists >= settings['dist_clouds']
+            shoreline = shoreline[idx_keep]
+            
+        if len(shoreline) > 0 and np.sum(im_nodata) > 0:
+            idx_cloud = np.where(im_nodata)
+            idx_cloud = np.column_stack((idx_cloud[0], idx_cloud[1]))
+            coords_cloud = SDS_tools.convert_epsg(SDS_tools.convert_pix2world(idx_cloud, georef),
+                                                   image_epsg, settings['output_epsg'])
+            tree = cKDTree(coords_cloud)
+            dists, _ = tree.query(shoreline, k=1, distance_upper_bound=30)
+            idx_keep = dists >= 30
+            shoreline = shoreline[idx_keep]
+            
+        return shoreline
+
+    SDS_shoreline.process_shoreline = _fast_process_shoreline
+    SDS_shoreline._patched_process_shoreline = True
+
+
+def _patch_extract_shorelines_print():
+    """Inject a wrapper around print to set flush=True."""
+    import builtins
+    import sys
+    if "coastsat.SDS_shoreline" not in sys.modules:
+        return
+    SDS_shoreline = sys.modules["coastsat.SDS_shoreline"]
+    
+    if getattr(SDS_shoreline, "_patched_print", False):
+        return
+
+    _orig_print = builtins.print
+    def _flushed_print(*args, **kwargs):
+        kwargs["flush"] = True
+        return _orig_print(*args, **kwargs)
+        
+    SDS_shoreline.print = _flushed_print
+    SDS_shoreline._patched_print = True
 
 
 # Where CoastSat expects the cloned repo on disk
@@ -199,6 +303,26 @@ def _download_shorelines(cfg: PipelineConfig) -> dict[str, Any]:
             "Then install CoastSat: pip install CoastSat",
             cause=e) from e
 
+    _patch_process_shoreline()
+    _patch_extract_shorelines_print()
+
+    # #3 Server-side cloud pre-filter. CoastSat hardcodes a loose 95% scene
+    # cloud-cover cutoff inside get_image_info() (it calls remove_cloudy_images
+    # with the default prc_cloud_cover). get_image_info looks the function up in
+    # the module namespace at call time, so reassigning it here lowers the
+    # threshold and we never download near-hopeless scenes. Idempotent: the
+    # original is stashed so repeated calls don't re-wrap.
+    import functools
+    _orig_remove_cloudy = getattr(SDS_download, "_orig_remove_cloudy_images", None)
+    if _orig_remove_cloudy is None:
+        _orig_remove_cloudy = SDS_download.remove_cloudy_images
+        SDS_download._orig_remove_cloudy_images = _orig_remove_cloudy
+    SDS_download.remove_cloudy_images = functools.partial(
+        _orig_remove_cloudy, prc_cloud_cover=cfg.shoreline_cloud_cover_max
+    )
+    print(f"[shoreline       ] cloud pre-filter: dropping scenes >"
+          f"{cfg.shoreline_cloud_cover_max}% cloud before download", flush=True)
+
     try:
         ee.Initialize(project=cfg.shoreline_gee_project)
     except Exception:
@@ -215,12 +339,12 @@ def _download_shorelines(cfg: PipelineConfig) -> dict[str, Any]:
         "polygon": polygon,
         "dates": [cfg.t_start, cfg.t_end],
         "sat_list": ["S2"],
-        "sitename": cfg.shoreline_sitename,
+        "sitename": f"{cfg.shoreline_sitename}_{cfg.t_start}_to_{cfg.t_end}",
         "filepath": str(cfg.data_dir),
     }
     settings = {
         "inputs": inputs,
-        "cloud_thresh": 0.5,
+        "cloud_thresh": cfg.shoreline_cloud_cover_max / 100.0,
         "dist_clouds": 300,
         # Output in the region's UTM projection so polylines and transects
         # are in the same CRS for intersection.
@@ -239,11 +363,24 @@ def _download_shorelines(cfg: PipelineConfig) -> dict[str, Any]:
         "buffer_size": 150,
     }
 
+    if cfg.region.baseline:
+        try:
+            from coastal_pinn.sources.transects import generate_transects
+            transects_df = generate_transects(cfg.region)
+            mid_x = (transects_df["origin_x"] + transects_df["end_x"]) / 2.0
+            mid_y = (transects_df["origin_y"] + transects_df["end_y"]) / 2.0
+            settings["reference_shoreline"] = np.column_stack((mid_x, mid_y))
+            settings["max_dist_ref"] = 150
+            print("[shoreline       ] applied reference shoreline buffer (150m)", flush=True)
+        except Exception as e:
+            print(f"[shoreline       ] Could not generate reference shoreline: {e}", flush=True)
+
     MAX_TILE_DEG = 0.10
     lon_span = lon_max - lon_min
     lat_span = lat_max - lat_min
 
     if lon_span <= MAX_TILE_DEG and lat_span <= MAX_TILE_DEG:
+        site_dir = Path(inputs["filepath"]) / inputs["sitename"]
         print("[shoreline       ] downloading satellite images from GEE...", flush=True)
         metadata = SDS_download.retrieve_images(inputs)
         if cfg.shoreline_save_qc:
@@ -252,12 +389,37 @@ def _download_shorelines(cfg: PipelineConfig) -> dict[str, Any]:
         print("[shoreline       ] extracting shorelines (pixel classifier + sub-pixel)...", flush=True)
         result = SDS_shoreline.extract_shorelines(metadata, settings)
         print(f"[shoreline       ] extracted {len(result.get('dates', []))} shorelines", flush=True)
+        # Reclaim the downloaded TIFFs once shorelines are extracted.
+        shutil.rmtree(site_dir, ignore_errors=True)
         return result
 
     import concurrent.futures
 
     tiles = _tile_polygon(polygon, MAX_TILE_DEG)
-    print(f"[shoreline       ] bbox too large, tiling into {len(tiles)} tiles. Downloading with 18 threads...", flush=True)
+
+    # #2 Prune tiles that don't touch the coastline. The bbox is a rectangle
+    # but the coast is a thin line through it, so many tiles are pure ocean or
+    # inland and would download imagery with no shoreline to extract. Keep a
+    # tile if any baseline vertex falls within it (expanded by a buffer that
+    # covers the seaward transect extent, since the shoreline lies offshore of
+    # the baseline). Tile indices stay tied to the full grid so the per-tile
+    # cache keys (sitenames) are stable regardless of pruning.
+    baseline = cfg.region.baseline
+    if baseline:
+        buffer_deg = max(0.01, (cfg.region.transect_length_m / 111_000.0) * 1.5)
+        kept = [(i, t) for i, t in enumerate(tiles)
+                if _tile_has_coast(t, baseline, buffer_deg)]
+    else:
+        kept = list(enumerate(tiles))
+    n_skipped = len(tiles) - len(kept)
+
+    # #1 Concurrency. Each in-flight tile's TIFFs are deleted right after
+    # extraction (see _process_tile), so peak disk ~= DOWNLOAD_WORKERS tiles.
+    DOWNLOAD_WORKERS = cfg.shoreline_download_workers
+    print(f"[shoreline       ] tiling into {len(tiles)} tiles; {len(kept)} intersect "
+          f"the coast, skipping {n_skipped} ocean/land tiles. Downloading with "
+          f"{DOWNLOAD_WORKERS} threads (imagery deleted per tile after extraction)...",
+          flush=True)
     merged_result: dict[str, list] = {}
 
     def _process_tile(tile_idx, tile):
@@ -268,6 +430,19 @@ def _download_shorelines(cfg: PipelineConfig) -> dict[str, Any]:
         tile_settings = dict(settings)
         tile_settings["inputs"] = tile_inputs
 
+        # CoastSat writes this tile's downloaded imagery (the multi-year S2
+        # stack, several GB) into <filepath>/<sitename>/. The shorelines are
+        # extracted into tile_result (in memory), after which the raw TIFFs
+        # are no longer needed. We delete the tile folder as soon as the tile
+        # is done so peak disk stays ~one tile's worth instead of all tiles
+        # at once — essential on a single-drive machine.
+        tile_dir = Path(inputs["filepath"]) / tile_inputs["sitename"]
+        tile_cache = Path(inputs["filepath"]) / "shoreline" / f"{tile_inputs['sitename']}.pkl"
+
+        if tile_cache.exists():
+            print(f"[shoreline       ] tile {tile_idx+1}/{len(tiles)}: loaded from tile cache ({tile_inputs['sitename']})", flush=True)
+            return read_pickle(tile_cache)
+
         print(f"[shoreline       ] tile {tile_idx+1}/{len(tiles)}: downloading...", flush=True)
         try:
             metadata = SDS_download.retrieve_images(tile_inputs)
@@ -277,13 +452,25 @@ def _download_shorelines(cfg: PipelineConfig) -> dict[str, Any]:
             print(f"[shoreline       ] tile {tile_idx+1}/{len(tiles)}: extracting shorelines...", flush=True)
 
             tile_result = SDS_shoreline.extract_shorelines(metadata, tile_settings)
+            
+            # Save the cache incrementally!
+            tile_cache.parent.mkdir(parents=True, exist_ok=True)
+            write_pickle_atomic(tile_result, tile_cache)
+            
             return tile_result
         except Exception as e:
             print(f"[shoreline       ] tile {tile_idx+1}/{len(tiles)} failed: {e}. Skipping.", flush=True)
             return None
+        finally:
+            # Reclaim the tile's imagery only if extraction succeeded and was cached.
+            # This allows interrupted pipelines to reuse already-downloaded imagery.
+            if tile_cache.exists():
+                shutil.rmtree(tile_dir, ignore_errors=True)
+                print(f"[shoreline       ] tile {tile_idx+1}/{len(tiles)}: "
+                      f"cleaned up imagery ({tile_dir.name})", flush=True)
 
-    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as executor:
-        futures = {executor.submit(_process_tile, i, tile): i for i, tile in enumerate(tiles)}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=DOWNLOAD_WORKERS) as executor:
+        futures = {executor.submit(_process_tile, i, tile): i for i, tile in kept}
         for future in concurrent.futures.as_completed(futures):
             tile_result = future.result()
             if tile_result is not None:
@@ -291,6 +478,28 @@ def _download_shorelines(cfg: PipelineConfig) -> dict[str, Any]:
                     merged_result.setdefault(key, []).extend(value)
 
     return merged_result
+
+
+def _tile_has_coast(tile: list[list[float]],
+                    baseline: "tuple[tuple[float, float], ...]",
+                    buffer_deg: float) -> bool:
+    """True if any baseline (lon, lat) vertex falls within `tile`, expanded by
+    `buffer_deg`.
+
+    The baseline vertices are far denser than the tile size, so every tile the
+    coast passes through contains at least one vertex; `buffer_deg` extends the
+    test to catch the shoreline where it lies just seaward of the baseline (or
+    just across a tile boundary). Tiles with no coast are pure ocean/inland and
+    are skipped to avoid downloading imagery with no shoreline to extract.
+    """
+    lons = [p[0] for p in tile]
+    lats = [p[1] for p in tile]
+    lon0, lon1 = min(lons) - buffer_deg, max(lons) + buffer_deg
+    lat0, lat1 = min(lats) - buffer_deg, max(lats) + buffer_deg
+    for lon, lat in baseline:
+        if lon0 <= lon <= lon1 and lat0 <= lat <= lat1:
+            return True
+    return False
 
 
 def _tile_polygon(polygon: list[list[float]], max_deg: float = 0.25) -> list[list[list[float]]]:
@@ -374,25 +583,36 @@ def _intersect_with_transects(shoreline_dict: dict[str, Any],
         _warn_if_low_intersection(use_coastsat_intersect, n_transects)
         return use_coastsat_intersect
 
-    # Shapely fallback: per-transect intersection for each (date, polyline)
+    # Shapely fallback: per-transect intersection for each (date, polyline).
+    # Pre-convert transect rows to lists for fast iteration (avoids pandas
+    # per-row overhead inside the hot loop).
+    transect_rows = [
+        (
+            int(tr["transect_id"]),
+            float(tr["along_shore_x_m"]),
+            (float(tr["origin_x"]), float(tr["origin_y"])),
+            (float(tr["end_x"]),   float(tr["end_y"])),
+        )
+        for _, tr in transects_df.iterrows()
+    ]
+    n_transects = len(transect_rows)
+    n_dates     = len(polylines)
+    print(f"[shoreline       ] Shapely intersection: {n_dates} dates × "
+          f"{n_transects} transects...", flush=True)
     rows: list[dict[str, Any]] = []
-    for ts, polyline_xy, sat in polylines:
+    for idx, (ts, polyline_xy, sat) in enumerate(polylines):
+        if idx % 100 == 0:
+            print(f"[shoreline       ]   date {idx}/{n_dates} ...", flush=True)
         ts_utc = ensure_utc(pd.Timestamp(ts))
-        for _, tr in transects_df.iterrows():
-            d = transect_intersection_distance(
-                polyline_xy,
-                (float(tr["origin_x"]), float(tr["origin_y"])),
-                (float(tr["end_x"]), float(tr["end_y"])),
-            )
+        for tid, along_x, origin, end in transect_rows:
+            d = transect_intersection_distance(polyline_xy, origin, end)
             if d is None or not np.isfinite(d):
                 continue
-            # Clamp negative distances to 0 (shoreline cannot be inland of
-            # baseline by definition)
             d_clamped = max(0.0, float(d))
             rows.append({
                 "timestamp": ts_utc,
-                "transect_id": int(tr["transect_id"]),
-                "along_shore_x_m": float(tr["along_shore_x_m"]),
+                "transect_id": tid,
+                "along_shore_x_m": along_x,
                 "cross_shore_S_m": d_clamped,
                 "sat": str(sat),
             })
@@ -430,84 +650,14 @@ def _warn_if_low_intersection(df: pd.DataFrame, n_transects: int) -> None:
 
 
 def _try_use_coastsat_intersect(shoreline_dict, transects_df, cfg):
-    """Try to use CoastSat's SDS_transects.compute_intersection_QC.
+    """Intentionally disabled: CoastSat's compute_intersection_QC contains an
+    O(N_transects × N_dates × N_shoreline_points) pure-Python inner loop that
+    hangs for large inputs (e.g. 1,173 transects × 2,395 dates × ~10k points
+    per polyline). We always fall back to our own vectorized Shapely-based
+    intersection, which is correct and fast.
 
-    Returns a DataFrame in our schema, or None if CoastSat's transect
-    module isn't available / the polylines aren't in the expected format.
+    Returns None unconditionally so _intersect_with_transects uses the Shapely
+    fallback path.
     """
-    repo = _resolve_coastsat_repo()
-    if repo is None:
-        return None
-    if str(repo) not in sys.path:
-        sys.path.insert(0, str(repo))
-    try:
-        from coastsat import SDS_transects  # type: ignore
-    except Exception:
-        return None
+    return None
 
-    # Build CoastSat transects dict: {name: np.array of [[x0,y0],[x1,y1]]}
-    cs_transects: dict[str, np.ndarray] = {}
-    for _, tr in transects_df.iterrows():
-        name = f"t{int(tr['transect_id']):04d}"
-        cs_transects[name] = np.array([
-            [float(tr["origin_x"]), float(tr["origin_y"])],
-            [float(tr["end_x"]), float(tr["end_y"])],
-        ])
-
-    settings_qc = {
-        "along_dist": 25,
-        "min_points": 3,
-        "max_std": 15,
-        "max_range": 30,
-        "min_chainage": -100,
-        "multiple_inter": "auto",
-        "auto_prc": 0.1,
-    }
-    try:
-        cross_distance = SDS_transects.compute_intersection_QC(
-            shoreline_dict, cs_transects, settings_qc
-        )
-    except Exception:
-        return None
-
-    # cross_distance is {transect_name: np.array of per-date distances}
-    rows: list[dict[str, Any]] = []
-    # Need to recover timestamps and sat per index
-    if "dates" in shoreline_dict and "shorelines" in shoreline_dict:
-        dates = list(shoreline_dict["dates"])
-        sats = list(shoreline_dict.get("satname") or ["UNK"] * len(dates))
-    else:
-        dates, sats = [], []
-        for sat, data in shoreline_dict.items():
-            if isinstance(data, dict) and "dates" in data:
-                for ts in data["dates"]:
-                    dates.append(ts)
-                    sats.append(str(sat))
-    if len(sats) < len(dates):
-        sats = sats + ["UNK"] * (len(dates) - len(sats))
-
-    transect_by_name = {f"t{int(r['transect_id']):04d}": r
-                        for _, r in transects_df.iterrows()}
-    for name, distances in cross_distance.items():
-        tr = transect_by_name.get(name)
-        if tr is None:
-            continue
-        for i, d in enumerate(distances):
-            if i >= len(dates):
-                break
-            if d is None or not np.isfinite(d):
-                continue
-            d_clamped = max(0.0, float(d))
-            rows.append({
-                "timestamp": ensure_utc(pd.Timestamp(dates[i])),
-                "transect_id": int(tr["transect_id"]),
-                "along_shore_x_m": float(tr["along_shore_x_m"]),
-                "cross_shore_S_m": d_clamped,
-                "sat": sats[i] if i < len(sats) else "UNK",
-            })
-    if not rows:
-        return None
-    df = pd.DataFrame(rows)
-    df["region"] = cfg.region.name
-    return df[["region", "timestamp", "transect_id", "along_shore_x_m",
-               "cross_shore_S_m", "sat"]]

@@ -30,14 +30,19 @@ Columns:
     depth_m             float, GEBCO depth at this transect (static)
 
 The shoreline model is the Yates et al. (2009) cross-shore equilibrium ODE
-with the Vitousek et al. (2017) CoSMoS-COAST long-term trend term:
+with the Vitousek et al. (2017) CoSMoS-COAST long-term trend term. The
+equilibrium wave energy is a LINEAR function of shoreline position,
+E_eq(S) = a*S + b — this S-dependence is the restoring feedback that makes the
+system a genuine dynamical system (non-zero Jacobian, real equilibria,
+eigenvalue stability):
 
-    dS/dt = C_pm * sqrt(E) * (E - E_eq) + v
+    dS/dt = C_pm * sqrt(E) * (E - (a*S + b)) + v
 
-E_wave is the only model-specific quantity provided by the data; the
-coefficients C_pm (accretion/erosion rate), E_eq (equilibrium wave energy),
-and v (long-term linear trend, e.g. the Volta/Akosombo sediment cutoff at
-Keta) are all LEARNED by the PINN and are not data columns.
+S is measured SEAWARD from the inland baseline, so dS/dt > 0 is accretion and
+dS/dt < 0 is erosion. E_wave is the data-side forcing; the coefficients C_pm
+(accretion/erosion rate), a and b (slope/intercept of the equilibrium-energy
+line E_eq(S)), and v (long-term linear trend, e.g. the Volta/Akosombo sediment
+cutoff at Keta) are all LEARNED by the PINN and are not data columns.
 """
 
 from __future__ import annotations

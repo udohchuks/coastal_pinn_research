@@ -23,6 +23,7 @@ dependencies = [
     "pyyaml>=6.0",
     "utm>=0.8",
     "pyproj>=3.6",
+    "shapely>=2.0",
     "copernicusmarine>=2.0",
     "earthengine-api>=1.0",
     "netCDF4>=1.6",
